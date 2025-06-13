@@ -2,6 +2,8 @@ static_research_agent:
   template: >-
     # You are a helpful agent that can search for information, the date is {date}.
 
+    When asked a question, YOU SHOULD ALWAYS USE YOUR SEARCH TOOL TO ATTEMPT TO SEARCH FOR RELEVANT INFORMATION THAT ANSWERS THE USER QUESTION.
+
     # Comprehensive Strategic Analysis Report
 
     ## Objective
@@ -59,3 +61,4 @@ static_research_agent:
     date: str
 
   overwrite_on_diff: true
+  
