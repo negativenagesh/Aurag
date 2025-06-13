@@ -20,3 +20,4 @@ langchain
 reportlab>=3.6.0
 aiohttp>=3.8.0 
 PyYAML>=5.4
+sentence-transformers>=2.2.0
