@@ -27,7 +27,6 @@ except ImportError as e:
 load_dotenv()
 logger = setup_logger(__name__)
 
-# --- Agent Configuration ---
 DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_AGENT_CONFIG_PATH = Path(__file__).parent.parent / "prompts" / "static_research_agent.yaml"
@@ -51,7 +50,7 @@ class StaticResearchAgent:
             self.llm_client = llm_client
 
         if retriever is None:
-            self.retriever = RAGFusionRetriever() # Assumes RAGFusionRetriever can be default initialized
+            self.retriever = RAGFusionRetriever()
             logger.info("Initialized default RAGFusionRetriever for StaticResearchAgent.")
         else:
             self.retriever = retriever
@@ -100,7 +99,6 @@ class StaticResearchAgent:
             logger.info(f"Successfully loaded prompt template for '{prompt_key}' from agent config.")
             return prompt_details["template"]
         else:
-            # Fallback or error if not found in main config; could load from separate prompt file
             logger.warning(f"Prompt template for '{prompt_key}' not found directly in agent config. Attempting to load from default prompts location.")
             try:
                 prompt_file_path = Path(__file__).parent.parent / "prompts" / f"{prompt_key}.yaml"
@@ -114,7 +112,6 @@ class StaticResearchAgent:
                     raise ValueError(f"Invalid or missing prompt structure for {prompt_key}")
             except Exception as e:
                 logger.error(f"Failed to load fallback prompt for {prompt_key}: {e}", exc_info=True)
-                # Provide a very basic default if all else fails
                 return "You are a helpful assistant. Answer the user's query based on the provided context. Today's date is {date}."
 
 
@@ -132,16 +129,14 @@ class StaticResearchAgent:
             formatted_texts.append(f"\n--- Results for Sub-query: \"{sq_text}\" ---")
             
             chunks = sq_result.get("reranked_chunks", [])
-            # Key "retrieved_kg_data" is used by RAGFusionRetriever's output dict
             kg_data = sq_result.get("retrieved_kg_data", []) 
 
             if chunks:
                 formatted_texts.append("\nVector Search Results (Chunks):")
-                for idx, chunk in enumerate(chunks[:3]): # Limit displayed chunks per subquery
+                for idx, chunk in enumerate(chunks[:3]):
                     doc_id = chunk.get('doc_id', 'unknown_doc')
                     page_num = chunk.get('page_number', 'N/A')
-                    chunk_idx_page = chunk.get('chunk_index_in_page', idx) # Use actual index if available
-                    # Construct a unique-ish ID for citation
+                    chunk_idx_page = chunk.get('chunk_index_in_page', idx)
                     source_id = f"c_{doc_id.replace('-', '')[:6]}_p{page_num}_i{chunk_idx_page}" 
                     
                     text_snippet = chunk.get('text', 'N/A')
@@ -177,14 +172,12 @@ class StaticResearchAgent:
     def _parse_llm_tool_calls(self, response_content: str) -> List[Dict[str, Any]]:
         tool_calls = []
         try:
-            # Attempt to find <ToolCalls> ... </ToolCalls> block
             tool_calls_match = re.search(r"<ToolCalls>(.*?)</ToolCalls>", response_content, re.DOTALL)
             if not tool_calls_match:
                 return []
 
             tool_calls_xml_str = tool_calls_match.group(1)
-            # Wrap in a root element for robust parsing if not already present
-            if not tool_calls_xml_str.strip().startswith("<root>"): # A bit simplistic, assumes no other root
+            if not tool_calls_xml_str.strip().startswith("<root>"):
                  tool_calls_xml_str = f"<root>{tool_calls_xml_str}</root>"
 
             root = ET.fromstring(tool_calls_xml_str)
@@ -210,21 +203,17 @@ class StaticResearchAgent:
             return f"Error: Tool '{tool_name}' not found."
 
         try:
-            tool_output: Any # Define tool_output to hold various types before string conversion
+            tool_output: Any
 
-            # Specific handling for search_file_knowledge
             if tool_name == "search_file_knowledge":
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_knowledge."
                 
-                # knowledge_search_method returns AggregateSearchResult
                 tool_output_obj = await self.knowledge_search_method(query=query, agent_config=current_config) 
                 
-                # Format AggregateSearchResult object into a string for the LLM
                 formatted_output_parts = []
                 if tool_output_obj.chunk_search_results:
                     formatted_output_parts.append("Chunk Results:")
-                    # Limit display using config, default to 2 if not set
                     max_display = current_config.get("tool_max_chunk_results_display", 2)
                     for idx, r in enumerate(tool_output_obj.chunk_search_results[:max_display]):
                         doc_id_str = r.doc_id.replace('-', '')[:6] if r.doc_id else 'unknown'
@@ -266,11 +255,7 @@ class StaticResearchAgent:
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_descriptions."
                 logger.warning("search_file_descriptions tool is using general RAG search, not a dedicated description search.")
-                # This method should ideally return something that can be formatted, perhaps a list of doc summaries.
-                # For now, using the agent's file_search_method which calls retriever.search
                 search_results_dict = await self.file_search_method(query=query, agent_config=current_config)
-                # Format this dict; _format_search_results is designed for the full retriever output.
-                # We might need a simpler formatter here or adapt file_search_method's return.
                 return self._format_search_results(search_results_dict, subquery_limit=1)
 
 
@@ -278,12 +263,11 @@ class StaticResearchAgent:
                 doc_id = parameters.get("document_id")
                 if not doc_id: return "Error: 'document_id' parameter missing for get_file_content."
                 logger.warning(f"get_file_content tool is simulating full doc retrieval using RAG search for doc_id: {doc_id}.")
-                # This method should ideally return the full document content or a significant portion.
                 content_results_dict = await self.content_method(filters={"id": {"$eq": doc_id}}, agent_config=current_config)
                 # Format this dict.
                 return self._format_search_results(content_results_dict, subquery_limit=1) # Assuming similar structure for now
 
-            else: # Fallback for other tools or if direct mapping isn't implemented
+            else: 
                 if hasattr(tool_instance, 'execute'):
                     if asyncio.iscoroutinefunction(tool_instance.execute):
                         tool_output = await tool_instance.execute(**parameters)
@@ -436,7 +420,6 @@ class StaticResearchAgent:
         last_llm_content = messages[-1]["content"] if messages and messages[-1]["role"] == "assistant" else "Max iterations reached without a conclusive answer."
         return {"answer": last_llm_content, "history": messages, "warning": "Max iterations reached"}
 
-    # --- Methods for tools to call if agent is their context ---
     async def knowledge_search_method(self, query: str, agent_config: Optional[Dict[str, Any]] = None) -> AggregateSearchResult:
         effective_config = agent_config or self.config # Use passed config or agent's default
         logger.debug(f"Agent's knowledge_search_method called with query: {query}")
