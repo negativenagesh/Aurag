@@ -17,7 +17,6 @@ from ...utils.logging_config import setup_logger
 load_dotenv()
 logger = setup_logger(__name__)
 
-# --- Configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
@@ -25,8 +24,6 @@ OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_BASE_DIMENSION", 3072))
 ELASTICSEARCH_INDEX_CHUNKS = os.getenv("ELASTICSEARCH_INDEX_CHUNKS", "r2rtest00")
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "mixedbread-ai/mxbai-rerank-large-v1")
 
-
-# --- Initialize Clients ---
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY not found. OpenAI client will not be functional.")
     aclient_openai = None
@@ -35,8 +32,8 @@ else:
 
 try:
     es_client = AsyncElasticsearch(
-        os.getenv("ELASTICSEARCH_URL", "https://my-elasticsearch-project-c44c4f.es.us-east-1.aws.elastic.cloud:443"),
-        api_key=os.getenv("ELASTICSEARCH_API_KEY", "cWR0WFU1Y0I3YS1td2g2cWdpV186VTdnNFNVWmRmWVI5dnd3WEwwOWdMQQ=="),
+        os.getenv("ELASTICSEARCH_URL"),
+        api_key=os.getenv("ELASTICSEARCH_API_KEY"),
         request_timeout=30
     )
     logger.info("AsyncElasticsearch client initialized for RAGFusionRetriever.")
@@ -66,7 +63,6 @@ class RAGFusionRetriever:
 
     def _load_prompt_template(self, prompt_name: str) -> str:
         try:
-            # Assuming prompts are in src/core/prompts/
             prompt_file_path = Path(__file__).parent.parent / "prompts" / f"{prompt_name}.yaml"
             with open(prompt_file_path, 'r') as f:
                 prompt_data = yaml.safe_load(f)
@@ -120,67 +116,67 @@ class RAGFusionRetriever:
 
         entity_extraction_prompt = """You are a highly specialized AI assistant for precise Named Entity Recognition (NER) from search queries. Your primary task is to identify and extract ALL relevant named entities from the given text. These entities are crucial for querying a knowledge graph effectively.
 
-**Entity Types to Extract:**
-Focus on, but do not limit yourself to, the following types. Be discerning and prioritize entities that would typically be indexed and searchable in a knowledge graph:
--   **People:** (e.g., "Elon Musk", "Dr. Jane Goodall", "Marie Curie")
--   **Organizations/Companies/Institutions:** (e.g., "OpenAI", "Google", "NASA", "United Nations", "Stanford University", "NIST")
--   **Locations:** (Specific cities, countries, geographical features, e.g., "Paris", "Mount Everest", "Silicon Valley", "Mars", "California")
--   **Products/Services/Technologies:** (e.g., "iPhone 15", "GPT-4", "AWS S3", "Tesla Model S", "H100 GPU", "TPU v5", "Llama 2")
--   **Specific Scientific or Technical Concepts/Fields:** (When they are well-defined and central to the query, e.g., "Quantum Computing", "Machine Learning", "CRISPR", "Blockchain", "General Relativity", "cryptographic security protocols")
--   **Named Events:** (e.g., "Apollo 11 Moon Landing", "WWDC 2023", "COP28 Summit", "French Revolution")
--   **Specific Dates/Time Periods:** (If they are specific, named, and central, e.g., "Q4 2023 earnings", "Industrial Revolution", "Renaissance period")
--   **Key Acronyms/Abbreviations:** (If they represent specific named entities and are common identifiers, e.g., "NASA", "WHO", "IBM", "GDPR")
--   **Specific Laws/Regulations/Treaties/Standards:** (e.g., "GDPR", "Paris Agreement", "ISO 27001")
--   **Named Projects/Initiatives/Programs:** (e.g., "Human Genome Project", "Project Artemis", "Manhattan Project")
--   **Works of Art/Literature/Music:** (e.g., "Mona Lisa", "The Great Gatsby", "Bohemian Rhapsody")
-
-**Output Format:**
-Return the extracted entities as a single, comma-separated string. Each entity should be a distinct string.
-Example: "Entity One,Entity Two,Another Entity"
-
-**Critical Instructions for Accuracy & Comprehensiveness:**
-1.  **Extract ALL:** Your primary goal is to extract *every* identifiable named entity that would be useful for a knowledge graph query. Do not be conservative; if it's a named entity relevant to the query's core, extract it.
-2.  **Precision and Fullness:** Capture the most complete and precise form of the entity as it appears or is commonly known.
-3.  **Synonyms and Alternative Names for KG Matching:** For certain types of entities, especially **Locations** and **Organizations**, if there are very common alternative names or synonyms that are likely to be used interchangeably in a knowledge graph, include them. Your goal is to maximize the chances of matching an entity in the KG.
-    *   For example:
-        *   If the query mentions 'Bangalore', and 'Bengaluru' is a common alternative, output: `Bangalore,Bengaluru`.
-        *   If the query mentions 'USA', and 'United States', 'United States of America', or 'America' are common alternatives, consider outputting: `USA,United States,America` (choose the most relevant and common ones for KG lookup).
-        *   If the query mentions 'WHO', also include `World Health Organization` if it's a likely synonym in the KG: `WHO,World Health Organization`.
-    *   Be judicious. Only include highly common and relevant alternatives. Do not generate an excessive number of synonyms for every entity.
-4.  **Multi-Word Entities:** Correctly identify and group multi-word entities (e.g., "New York City" not "New", "York", "City"; "Chief Executive Officer" if it refers to a specific role being discussed as an entity type, though usually you'd extract the person's name holding that role).
-5.  **Specificity is Key:** Distinguish between general nouns/concepts and specific *named* entities.
-    *   "artificial intelligence" is a broad field. However, if the query is "OpenAI's work in artificial intelligence", extract "OpenAI". If the query is "advancements in artificial intelligence by DeepMind", extract "artificial intelligence" (as a key concept for KG) and "DeepMind".
-    *   "database systems" is general. "PostgreSQL" is a specific named entity.
-6.  **Contextual Relevance:** Ensure extracted entities are central to the query's intent.
-7.  **No Entities Found:** If, after careful analysis, absolutely no distinct named entities suitable for a knowledge graph query are identified, return an **empty string** (e.g., ""). Do NOT invent entities or return general terms if they aren't acting as specific identifiers in the query.
-
-**Examples to Guide Extraction (incorporating synonyms):**
-
-**Example 1 (Standard Query with Multiple Entity Types & Location Synonym):**
-Query: "What were the key findings of the Human Genome Project regarding genetic research in Bangalore and its impact on companies like Genentech?"
-Output: "Human Genome Project,genetic research,Bangalore,Bengaluru,Genentech"
-
-**Example 2 (Technical Query with Products and Organizations):**
-Query: "Analyze the performance differences between NVIDIA's A100 and AMD's MI250X for deep learning workloads, specifically citing benchmarks from MLPerf."
-Output: "NVIDIA,A100,AMD,MI250X,deep learning,MLPerf"
-
-**Example 3 (Query with Acronyms, Locations, Concepts & Organization Synonym):**
-Query: "How is the EU's GDPR affecting data privacy policies of tech companies in California, particularly concerning AI development by the WHO?"
-Output: "EU,European Union,GDPR,data privacy,California,AI development,WHO,World Health Organization"
-
-**Example 4 (Query with No Specific Named Entities for KG):**
-Query: "What are some general tips for improving public speaking skills?"
-Output: ""
-
-**Example 5 (Historical Event with People and Locations):**
-Query: "Describe the role of Winston Churchill during the Blitz in London in World War II."
-Output: "Winston Churchill,The Blitz,London,World War II"
-
----
-Now, process the following search query according to all the above instructions.
-Query: {text}
-Output:
-"""
+            **Entity Types to Extract:**
+            Focus on, but do not limit yourself to, the following types. Be discerning and prioritize entities that would typically be indexed and searchable in a knowledge graph:
+            -   **People:** (e.g., "Elon Musk", "Dr. Jane Goodall", "Marie Curie")
+            -   **Organizations/Companies/Institutions:** (e.g., "OpenAI", "Google", "NASA", "United Nations", "Stanford University", "NIST")
+            -   **Locations:** (Specific cities, countries, geographical features, e.g., "Paris", "Mount Everest", "Silicon Valley", "Mars", "California")
+            -   **Products/Services/Technologies:** (e.g., "iPhone 15", "GPT-4", "AWS S3", "Tesla Model S", "H100 GPU", "TPU v5", "Llama 2")
+            -   **Specific Scientific or Technical Concepts/Fields:** (When they are well-defined and central to the query, e.g., "Quantum Computing", "Machine Learning", "CRISPR", "Blockchain", "General Relativity", "cryptographic security protocols")
+            -   **Named Events:** (e.g., "Apollo 11 Moon Landing", "WWDC 2023", "COP28 Summit", "French Revolution")
+            -   **Specific Dates/Time Periods:** (If they are specific, named, and central, e.g., "Q4 2023 earnings", "Industrial Revolution", "Renaissance period")
+            -   **Key Acronyms/Abbreviations:** (If they represent specific named entities and are common identifiers, e.g., "NASA", "WHO", "IBM", "GDPR")
+            -   **Specific Laws/Regulations/Treaties/Standards:** (e.g., "GDPR", "Paris Agreement", "ISO 27001")
+            -   **Named Projects/Initiatives/Programs:** (e.g., "Human Genome Project", "Project Artemis", "Manhattan Project")
+            -   **Works of Art/Literature/Music:** (e.g., "Mona Lisa", "The Great Gatsby", "Bohemian Rhapsody")
+            
+            **Output Format:**
+            Return the extracted entities as a single, comma-separated string. Each entity should be a distinct string.
+            Example: "Entity One,Entity Two,Another Entity"
+            
+            **Critical Instructions for Accuracy & Comprehensiveness:**
+            1.  **Extract ALL:** Your primary goal is to extract *every* identifiable named entity that would be useful for a knowledge graph query. Do not be conservative; if it's a named entity relevant to the query's core, extract it.
+            2.  **Precision and Fullness:** Capture the most complete and precise form of the entity as it appears or is commonly known.
+            3.  **Synonyms and Alternative Names for KG Matching:** For certain types of entities, especially **Locations** and **Organizations**, if there are very common alternative names or synonyms that are likely to be used interchangeably in a knowledge graph, include them. Your goal is to maximize the chances of matching an entity in the KG.
+                *   For example:
+                    *   If the query mentions 'Bangalore', and 'Bengaluru' is a common alternative, output: `Bangalore,Bengaluru`.
+                    *   If the query mentions 'USA', and 'United States', 'United States of America', or 'America' are common alternatives, consider outputting: `USA,United States,America` (choose the most relevant and common ones for KG lookup).
+                    *   If the query mentions 'WHO', also include `World Health Organization` if it's a likely synonym in the KG: `WHO,World Health Organization`.
+                *   Be judicious. Only include highly common and relevant alternatives. Do not generate an excessive number of synonyms for every entity.
+            4.  **Multi-Word Entities:** Correctly identify and group multi-word entities (e.g., "New York City" not "New", "York", "City"; "Chief Executive Officer" if it refers to a specific role being discussed as an entity type, though usually you'd extract the person's name holding that role).
+            5.  **Specificity is Key:** Distinguish between general nouns/concepts and specific *named* entities.
+                *   "artificial intelligence" is a broad field. However, if the query is "OpenAI's work in artificial intelligence", extract "OpenAI". If the query is "advancements in artificial intelligence by DeepMind", extract "artificial intelligence" (as a key concept for KG) and "DeepMind".
+                *   "database systems" is general. "PostgreSQL" is a specific named entity.
+            6.  **Contextual Relevance:** Ensure extracted entities are central to the query's intent.
+            7.  **No Entities Found:** If, after careful analysis, absolutely no distinct named entities suitable for a knowledge graph query are identified, return an **empty string** (e.g., ""). Do NOT invent entities or return general terms if they aren't acting as specific identifiers in the query.
+            
+            **Examples to Guide Extraction (incorporating synonyms):**
+            
+            **Example 1 (Standard Query with Multiple Entity Types & Location Synonym):**
+            Query: "What were the key findings of the Human Genome Project regarding genetic research in Bangalore and its impact on companies like Genentech?"
+            Output: "Human Genome Project,genetic research,Bangalore,Bengaluru,Genentech"
+            
+            **Example 2 (Technical Query with Products and Organizations):**
+            Query: "Analyze the performance differences between NVIDIA's A100 and AMD's MI250X for deep learning workloads, specifically citing benchmarks from MLPerf."
+            Output: "NVIDIA,A100,AMD,MI250X,deep learning,MLPerf"
+            
+            **Example 3 (Query with Acronyms, Locations, Concepts & Organization Synonym):**
+            Query: "How is the EU's GDPR affecting data privacy policies of tech companies in California, particularly concerning AI development by the WHO?"
+            Output: "EU,European Union,GDPR,data privacy,California,AI development,WHO,World Health Organization"
+            
+            **Example 4 (Query with No Specific Named Entities for KG):**
+            Query: "What are some general tips for improving public speaking skills?"
+            Output: ""
+            
+            **Example 5 (Historical Event with People and Locations):**
+            Query: "Describe the role of Winston Churchill during the Blitz in London in World War II."
+            Output: "Winston Churchill,The Blitz,London,World War II"
+            
+            ---
+            Now, process the following search query according to all the above instructions.
+            Query: {text}
+            Output:
+            """
 
         formatted_prompt_for_extraction = entity_extraction_prompt.format(text=text)
         logger.debug(f"Extracting entities from text: '{text[:100]}...' using advanced prompt.")
