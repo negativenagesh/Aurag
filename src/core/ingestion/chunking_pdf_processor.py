@@ -38,8 +38,6 @@ BACKWARD_CHUNKS = int(os.getenv("BACKWARD_CHUNKS", 3))
 CHARS_PER_TOKEN_ESTIMATE = 4 
 SUMMARY_MAX_TOKENS = 512
 
-
-# --- Initialize Clients ---
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY not found in .env. OpenAI client will not be functional.")
     aclient_openai = None
@@ -48,8 +46,8 @@ else:
 
 try:
     es_client = AsyncElasticsearch(
-        os.getenv("ELASTICSEARCH_URL", "https://my-elasticsearch-project-c44c4f.es.us-east-1.aws.elastic.cloud:443"),
-        api_key=os.getenv("ELASTICSEARCH_API_KEY", "cWR0WFU1Y0I3YS1td2g2cWdpV186VTdnNFNVWmRmWVI5dnd3WEwwOWdMQQ=="),
+        os.getenv("ELASTICSEARCH_URL"),
+        api_key=os.getenv("ELASTICSEARCH_API_KEY"),
         request_timeout=30
     )
     logger.info("AsyncElasticsearch client initialized.")
@@ -57,7 +55,6 @@ except Exception as e:
     logger.error(f"Failed to initialize AsyncElasticsearch client: {e}")
     es_client = None
 
-# --- Tokenizer Function ---
 def get_tokenizer_for_model(model_name: str):
     try:
         return tiktoken.encoding_for_model(model_name)
