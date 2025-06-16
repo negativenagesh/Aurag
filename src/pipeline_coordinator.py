@@ -1,4 +1,3 @@
-# src/pipeline_coordinator.py
 import asyncio
 import logging
 import os
