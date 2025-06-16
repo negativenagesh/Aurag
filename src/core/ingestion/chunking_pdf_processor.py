@@ -8,7 +8,8 @@ from pathlib import Path
 import copy 
 import xml.etree.ElementTree as ET 
 import re
-import hashlib # Added for SHA256 hashing
+import hashlib 
+import json
 
 from dotenv import load_dotenv
 from elasticsearch import AsyncElasticsearch
@@ -28,7 +29,7 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_BASE_DIMENSION", 3072))
 
-ELASTICSEARCH_INDEX_CHUNKS = os.getenv("ELASTICSEARCH_INDEX_CHUNKS", "r2rtest00") # Ensure this matches your target index
+ELASTICSEARCH_INDEX_CHUNKS = os.getenv("ELASTICSEARCH_INDEX_CHUNKS", "r2rtest0") 
 
 CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE", 3072)) 
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP", 512))
@@ -49,7 +50,7 @@ try:
     es_client = AsyncElasticsearch(
         os.getenv("ELASTICSEARCH_URL", "https://my-elasticsearch-project-c44c4f.es.us-east-1.aws.elastic.cloud:443"),
         api_key=os.getenv("ELASTICSEARCH_API_KEY", "cWR0WFU1Y0I3YS1td2g2cWdpV186VTdnNFNVWmRmWVI5dnd3WEwwOWdMQQ=="),
-        request_timeout=30  # Increased timeout from default 10s
+        request_timeout=30
     )
     logger.info("AsyncElasticsearch client initialized.")
 except Exception as e:
@@ -70,7 +71,6 @@ def tiktoken_len(text: str) -> int:
     tokens = tokenizer.encode(text, disallowed_special=())
     return len(tokens)
 
-# --- Elasticsearch Mapping Definition ---
 CHUNKED_PDF_MAPPINGS = {
     "mappings": {
         "properties": {
@@ -629,7 +629,7 @@ async def example_run_pdf_processing(pdf_data: str | bytes, original_file_name: 
                          sample_action_copy["_source"]["embedding"] = "<empty_embedding_vector>"
                     else: 
                         sample_action_copy["_source"]["embedding"] = f"<embedding_vector_unexpected_format: {type(embedding_val).__name__}>"
-                logger.info(json.dumps(sample_action_copy, indent=2, default=str)) # Ensure json is imported if used here
+                logger.info(json.dumps(sample_action_copy, indent=2, default=str))
 
             successes, errors = await async_bulk(es_client, actions_for_es, raise_on_error=False, raise_on_exception=False)
             logger.info(f"Elasticsearch bulk ingestion: {successes} successes.")
@@ -656,7 +656,6 @@ def _generate_doc_id_from_content(content_bytes: bytes) -> str:
     return sha256_hash.hexdigest()
 
 if __name__ == "__main__":
-    import json # Added for sample document logging
     logging.getLogger("src.core.ingestion.chunking_pdf_processor").setLevel(logging.DEBUG)
     logging.getLogger("__main__").setLevel(logging.DEBUG) 
     logging.getLogger("elasticsearch").setLevel(logging.WARNING) 
@@ -691,10 +690,8 @@ if __name__ == "__main__":
             logger.error(f"Failed to read PDF file '{pdf_path}': {e}")
             return
 
-        # --- MODIFIED: Automatic doc_id generation ---
         generated_doc_id = _generate_doc_id_from_content(pdf_bytes_data)
         logger.info(f"Generated Document ID (SHA256 of content) for '{original_file_name}': {generated_doc_id}")
-        # --- End MODIFIED ---
 
         user_provided_summary_input = input("Enter a brief summary for the document (for contextual prompts during processing, optional): ").strip()
         if not user_provided_summary_input:
@@ -705,7 +702,7 @@ if __name__ == "__main__":
         await example_run_pdf_processing(
             pdf_data=pdf_bytes_data, 
             original_file_name=original_file_name,
-            document_id=generated_doc_id, # Use generated doc_id
+            document_id=generated_doc_id, 
             user_provided_doc_summary=user_provided_summary_input 
         )
         

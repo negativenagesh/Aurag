@@ -2,14 +2,11 @@ import logging
 from typing import Any, Optional, List
 from uuid import UUID # Keep for potential future validation if needed, though not strictly used for ES query
 
-# Import Elasticsearch directly if not available via context, or ensure context provides it.
-# from elasticsearch import AsyncElasticsearch, NotFoundError # Example if direct import needed
+from elasticsearch import AsyncElasticsearch, NotFoundError # Example if direct import needed
 
 logger = logging.getLogger(__name__)
 
-# Assuming ELASTICSEARCH_INDEX_CHUNKS might be needed if not reliably from context
-# However, best practice is to get it from context (agent -> retriever)
-# from ..retrieval.rag_fusion_retriever import ELASTICSEARCH_INDEX_CHUNKS
+from ..retrieval.rag_fusion_retriever import ELASTICSEARCH_INDEX_CHUNKS
 
 
 class GetFileContentTool: # Removed (Tool) inheritance as we are not using its Pydantic model directly for return

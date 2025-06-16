@@ -5,7 +5,8 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 
 import yaml
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ try:
     from ..tools.search_file_descriptions import SearchFileDescriptionsTool
     from ..tools.get_file_content import GetFileContentTool
     from ...utils.logging_config import setup_logger
-    from ...core.base.abstractions import AggregateSearchResult # Assuming this path
+    from ...core.base.abstractions import AggregateSearchResult, ChunkSearchResult, KGSearchResult, KGEntity, KGRelationship # MODIFIED: Import new models
 except ImportError as e:
     print(f"ImportError in static_research_agent.py: {e}. Please ensure all dependencies are correctly placed and __init__.py files exist.")
     print("This agent expects RAGFusionRetriever, tools, and AggregateSearchResult to be importable from its location.")
@@ -27,115 +28,95 @@ load_dotenv()
 logger = setup_logger(__name__)
 
 # --- Agent Configuration ---
-DEFAULT_AGENT_MODEL = "gpt-4o-mini" # Cost-effective reasoning model
+DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_MAX_ITERATIONS = 5
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Helper to get attributes from objects or keys from dicts
-def get_attribute_or_key(obj: Any, key: str, default: Any = None) -> Any:
-    if hasattr(obj, key):
-        return getattr(obj, key)
-    elif isinstance(obj, dict) and key in obj:
-        return obj[key]
-    return default
+DEFAULT_AGENT_CONFIG_PATH = Path(__file__).parent.parent / "prompts" / "static_research_agent.yaml"
 
 class StaticResearchAgent:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.config = config or {}
-        self.llm_model = self.config.get("model", DEFAULT_AGENT_MODEL)
-        self.max_iterations = self.config.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    def __init__(
+        self,
+        llm_client: Optional[AsyncOpenAI] = None,
+        retriever: Optional[RAGFusionRetriever] = None,
+        config_path: Optional[Union[str, Path]] = None,
+        llm_model: Optional[str] = None,
+        max_iterations: Optional[int] = None,
+    ):
+        if llm_client is None:
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY not found and llm_client not provided.")
+            self.llm_client = AsyncOpenAI(api_key=openai_api_key)
+            logger.info("Initialized default AsyncOpenAI client for StaticResearchAgent.")
+        else:
+            self.llm_client = llm_client
 
-        if not OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY is not set. The agent cannot function.")
-        self.llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        if retriever is None:
+            self.retriever = RAGFusionRetriever() # Assumes RAGFusionRetriever can be default initialized
+            logger.info("Initialized default RAGFusionRetriever for StaticResearchAgent.")
+        else:
+            self.retriever = retriever
+            
+        self.config_path = Path(config_path) if config_path else DEFAULT_AGENT_CONFIG_PATH
+        self.config = self._load_config()
+        
+        self.llm_model = llm_model or self.config.get("model", DEFAULT_LLM_MODEL)
+        self.max_iterations = max_iterations or self.config.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+        
+        self.system_prompt_template = self._load_prompt_template_from_config("static_research_agent")
 
-        self.retriever = RAGFusionRetriever()
-        self.prompt_template_str = self._load_prompt_template("static_research_agent")
-
-        self.tools: Dict[str, Any] = {
+        # Initialize tools
+        self.tools = {
             "search_file_knowledge": SearchFileKnowledgeTool(),
             "search_file_descriptions": SearchFileDescriptionsTool(),
             "get_file_content": GetFileContentTool(),
         }
-        # Set a simplified context for tools; they might need adaptation
-        # for full functionality outside the R2R framework.
+        # Set context for tools if they need it (e.g., for calling agent's methods)
         for tool_instance in self.tools.values():
-            tool_instance.context = self # Agent itself acts as a basic context
+            if hasattr(tool_instance, 'set_context'):
+                tool_instance.set_context(self)
+        logger.info(f"StaticResearchAgent initialized with model: {self.llm_model}, max_iterations: {self.max_iterations}")
+        logger.debug(f"Tools available: {list(self.tools.keys())}")
 
-        self.tool_system_prompt = self._construct_tool_use_system_prompt()
-        logger.info(f"StaticResearchAgent initialized with model {self.llm_model} and tools: {list(self.tools.keys())}")
 
-    def _load_prompt_template(self, prompt_name: str) -> str:
+    def _load_config(self) -> Dict[str, Any]:
         try:
-            prompt_file_path = Path(__file__).parent.parent / "prompts" / f"{prompt_name}.yaml"
-            with open(prompt_file_path, 'r') as f:
-                prompt_data = yaml.safe_load(f)
-            
-            if prompt_data and prompt_name in prompt_data and "template" in prompt_data[prompt_name]:
-                template_content = prompt_data[prompt_name]["template"]
-                logger.info(f"Successfully loaded prompt template for '{prompt_name}'.")
-                return template_content
-            else:
-                logger.error(f"Prompt template for '{prompt_name}' not found or invalid in {prompt_file_path}.")
-                raise ValueError(f"Invalid prompt structure for {prompt_name}")
+            with open(self.config_path, 'r') as f:
+                config_data = yaml.safe_load(f)
+            if not isinstance(config_data, dict):
+                logger.error(f"Config file {self.config_path} did not load as a dictionary.")
+                return {}
+            logger.info(f"Successfully loaded agent config from {self.config_path}")
+            return config_data
         except FileNotFoundError:
-            logger.error(f"Prompt file not found: {prompt_file_path}")
-            raise
+            logger.error(f"Agent config file not found: {self.config_path}. Using empty config.")
+            return {}
         except Exception as e:
-            logger.error(f"Error loading prompt '{prompt_name}': {e}")
-            raise
+            logger.error(f"Error loading agent config from {self.config_path}: {e}", exc_info=True)
+            return {}
 
-    def _construct_format_tool_for_prompt(
-        self, name: str, description: str, parameters_schema: Dict[str, Any]
-    ) -> str:
-        """Formats a single tool's schema into the XML string for the prompt."""
-        param_xml_list = []
-        if parameters_schema and "properties" in parameters_schema:
-            required_params = parameters_schema.get("required", [])
-            for param_name, param_details in parameters_schema["properties"].items():
-                param_xml = f"<parameter>\n<name>{param_name}</name>\n"
-                param_xml += f"<type>{param_details.get('type', 'string')}</type>\n"
-                param_xml += f"<description>{param_details.get('description', '')}</description>\n"
-                if param_name in required_params:
-                    param_xml += f"<required>true</required>\n"
-                param_xml += "</parameter>"
-                param_xml_list.append(param_xml)
+    def _load_prompt_template_from_config(self, prompt_key: str) -> str:
+        prompt_details = self.config.get(prompt_key, {})
+        if isinstance(prompt_details, dict) and "template" in prompt_details:
+            logger.info(f"Successfully loaded prompt template for '{prompt_key}' from agent config.")
+            return prompt_details["template"]
+        else:
+            # Fallback or error if not found in main config; could load from separate prompt file
+            logger.warning(f"Prompt template for '{prompt_key}' not found directly in agent config. Attempting to load from default prompts location.")
+            try:
+                prompt_file_path = Path(__file__).parent.parent / "prompts" / f"{prompt_key}.yaml"
+                with open(prompt_file_path, 'r') as f:
+                    data = yaml.safe_load(f)
+                if data and prompt_key in data and "template" in data[prompt_key]:
+                    logger.info(f"Successfully loaded prompt template for '{prompt_key}' from {prompt_file_path}.")
+                    return data[prompt_key]["template"]
+                else:
+                    logger.error(f"Prompt template for '{prompt_key}' not found or invalid in {prompt_file_path}.")
+                    raise ValueError(f"Invalid or missing prompt structure for {prompt_key}")
+            except Exception as e:
+                logger.error(f"Failed to load fallback prompt for {prompt_key}: {e}", exc_info=True)
+                # Provide a very basic default if all else fails
+                return "You are a helpful assistant. Answer the user's query based on the provided context. Today's date is {date}."
 
-        return (
-            "<tool_description>\n"
-            f"<tool_name>{name}</tool_name>\n"
-            f"<description>{description}</description>\n"
-            "<parameters>\n" + "\n".join(param_xml_list) + "\n</parameters>\n"
-            "</tool_description>"
-        )
-
-    def _construct_tool_use_system_prompt(self) -> str:
-        tool_str_list = []
-        for tool_name, tool_instance in self.tools.items():
-            # Assuming tools have 'name', 'description', and 'parameters' (OpenAPI schema) attributes
-            description = get_attribute_or_key(tool_instance, "description", f"Tool named {tool_name}")
-            parameters_schema = get_attribute_or_key(tool_instance, "parameters", {})
-            tool_str = self._construct_format_tool_for_prompt(tool_name, description, parameters_schema)
-            tool_str_list.append(tool_str)
-
-        return (
-            "In this environment you have access to a set of tools you can use to answer the user's question.\n"
-            "\n"
-            "You may call them like this by including the following XML structure in your response:\n"
-            "<function_calls>\n"
-            "  <invoke>\n"
-            "    <tool_name>$TOOL_NAME</tool_name>\n"
-            "    <parameters>\n"
-            "      <$PARAMETER_NAME>$PARAMETER_VALUE</$PARAMETER_NAME>\n"
-            "      <!-- ... more parameters ... -->\n"
-            "    </parameters>\n"
-            "  </invoke>\n"
-            "  <!-- ... more invokes for parallel calls ... -->\n"
-            "</function_calls>\n"
-            "\n"
-            "Here are the tools available:\n"
-            "<tools>\n" + "\n".join(tool_str_list) + "\n</tools>"
-        )
 
     def _format_search_results(self, search_results: Optional[Dict[str, Any]], subquery_limit: int = 2) -> str:
         if not search_results or "sub_queries_results" not in search_results:
@@ -144,43 +125,48 @@ class StaticResearchAgent:
         formatted_texts = []
         sq_count = 0
         for i, sq_result in enumerate(search_results["sub_queries_results"]):
-            if sq_count >= subquery_limit and subquery_limit > 0: # Limit displayed subquery results
+            if sq_count >= subquery_limit and subquery_limit > 0: 
                 break
             
             sq_text = sq_result.get("sub_query_text", f"Sub-query {i+1}")
             formatted_texts.append(f"\n--- Results for Sub-query: \"{sq_text}\" ---")
             
             chunks = sq_result.get("reranked_chunks", [])
-            kg_data = sq_result.get("retrieved_kg_data", []) # Key updated as per previous request
+            # Key "retrieved_kg_data" is used by RAGFusionRetriever's output dict
+            kg_data = sq_result.get("retrieved_kg_data", []) 
 
             if chunks:
                 formatted_texts.append("\nVector Search Results (Chunks):")
-                for idx, chunk in enumerate(chunks):
+                for idx, chunk in enumerate(chunks[:3]): # Limit displayed chunks per subquery
                     doc_id = chunk.get('doc_id', 'unknown_doc')
                     page_num = chunk.get('page_number', 'N/A')
-                    chunk_idx = chunk.get('chunk_index_in_page', idx)
-                    source_id = f"c_{doc_id}_p{page_num}_i{chunk_idx}" # Construct a unique-ish ID
+                    chunk_idx_page = chunk.get('chunk_index_in_page', idx) # Use actual index if available
+                    # Construct a unique-ish ID for citation
+                    source_id = f"c_{doc_id.replace('-', '')[:6]}_p{page_num}_i{chunk_idx_page}" 
                     
                     text_snippet = chunk.get('text', 'N/A')
-                    if len(text_snippet) > 300: # Snippet for brevity
+                    if len(text_snippet) > 300: 
                         text_snippet = text_snippet[:297] + "..."
-                    formatted_texts.append(f"Source ID [{source_id}]: {text_snippet}")
+                    score_display = chunk.get('rerank_score', chunk.get('score')) # Prefer rerank_score
+                    score_str = f"{score_display:.4f}" if score_display is not None else "N/A"
+                    formatted_texts.append(f"Source ID [{source_id}]: {text_snippet} (Score: {score_str})")
             
             if kg_data:
                 formatted_texts.append("\nKnowledge Graph Results:")
-                for idx, kg_item in enumerate(kg_data):
+                for idx, kg_item in enumerate(kg_data[:2]): # Limit displayed KG items per subquery
                     doc_id = kg_item.get('doc_id', 'unknown_kg_doc')
                     page_num = kg_item.get('page_number', 'N/A')
-                    chunk_idx = kg_item.get('chunk_index_in_page', idx)
-                    source_id = f"kg_{doc_id}_p{page_num}_i{chunk_idx}"
+                    chunk_idx_page = kg_item.get('chunk_index_in_page', idx)
+                    source_id = f"kg_{doc_id.replace('-', '')[:6]}_p{page_num}_i{chunk_idx_page}"
 
-                    entities_str = ", ".join([e.get('name', 'N/A') for e in kg_item.get('entities', [])][:3]) # Show a few entities
+                    entities_str = ", ".join([e.get('name', 'N/A') for e in kg_item.get('entities', [])[:3]]) 
                     if len(kg_item.get('entities', [])) > 3: entities_str += "..."
                     
-                    rels_str = ", ".join([f"{r.get('source_entity','S')}->{r.get('relation','R')}->{r.get('target_entity','T')}" for r in kg_item.get('relationships', [])][:2]) # Show a few relationships
+                    rels_str = ", ".join([f"{r.get('source_entity','S')}->{r.get('relation','R')}->{r.get('target_entity','T')}" for r in kg_item.get('relationships', [])[:2]])
                     if len(kg_item.get('relationships', [])) > 2: rels_str += "..."
-
-                    formatted_texts.append(f"Source ID [{source_id}]: Entities: [{entities_str if entities_str else 'None'}]. Relationships: [{rels_str if rels_str else 'None'}]. (Associated chunk: {kg_item.get('chunk_text', '')[:100]}...)")
+                    
+                    chunk_text_snippet = kg_item.get('chunk_text', '')[:100] + "..." if kg_item.get('chunk_text') else "N/A"
+                    formatted_texts.append(f"Source ID [{source_id}]: Entities: [{entities_str if entities_str else 'None'}]. Relationships: [{rels_str if rels_str else 'None'}]. (Associated chunk: {chunk_text_snippet})")
             
             if not chunks and not kg_data:
                  formatted_texts.append("No specific chunks or KG data found for this sub-query.")
@@ -188,175 +174,218 @@ class StaticResearchAgent:
 
         return "\n".join(formatted_texts)
 
-    def _parse_llm_tool_calls(self, llm_response_content: str) -> Optional[List[Dict[str, Any]]]:
-        """Parses XML tool calls from the LLM's response content."""
+    def _parse_llm_tool_calls(self, response_content: str) -> List[Dict[str, Any]]:
         tool_calls = []
         try:
-            # Look for the <function_calls> block
-            match = re.search(r"<function_calls>(.*?)</function_calls>", llm_response_content, re.DOTALL)
-            if not match:
-                return None
-            
-            function_calls_xml_str = match.group(1)
-            # Wrap in a root element for robust parsing if it's just a sequence of <invoke>
-            root = ET.fromstring(f"<root_wrapper>{function_calls_xml_str}</root_wrapper>") 
-            
-            for invoke_element in root.findall("invoke"):
-                tool_name_element = invoke_element.find("tool_name")
-                parameters_element = invoke_element.find("parameters")
-                
-                if tool_name_element is not None and tool_name_element.text:
-                    tool_name = tool_name_element.text.strip()
-                    params = {}
-                    if parameters_element is not None:
-                        for param_child in parameters_element:
-                            # Tag name is $PARAMETER_NAME, text is $PARAMETER_VALUE
-                            # Strip potential '$' if model includes it literally
-                            param_key = param_child.tag.lstrip('$')
-                            params[param_key] = param_child.text.strip() if param_child.text else ""
-                    
-                    tool_calls.append({"tool_name": tool_name, "parameters": params})
-            
-            return tool_calls if tool_calls else None
-        except ET.ParseError as e:
-            logger.error(f"XML parsing error for tool calls: {e}\nContent: {llm_response_content}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error parsing tool calls: {e}\nContent: {llm_response_content}")
-            return None
+            # Attempt to find <ToolCalls> ... </ToolCalls> block
+            tool_calls_match = re.search(r"<ToolCalls>(.*?)</ToolCalls>", response_content, re.DOTALL)
+            if not tool_calls_match:
+                return []
 
-    async def _execute_tool_call(self, tool_name: str, parameters: Dict[str, Any]) -> str:
+            tool_calls_xml_str = tool_calls_match.group(1)
+            # Wrap in a root element for robust parsing if not already present
+            if not tool_calls_xml_str.strip().startswith("<root>"): # A bit simplistic, assumes no other root
+                 tool_calls_xml_str = f"<root>{tool_calls_xml_str}</root>"
+
+            root = ET.fromstring(tool_calls_xml_str)
+            for tool_call_elem in root.findall(".//ToolCall"):
+                name_elem = tool_call_elem.find("Name")
+                params_elem = tool_call_elem.find("Parameters")
+                if name_elem is not None and name_elem.text and params_elem is not None and params_elem.text:
+                    try:
+                        parameters = json.loads(params_elem.text)
+                        tool_calls.append({"tool_name": name_elem.text.strip(), "parameters": parameters})
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse JSON parameters for tool {name_elem.text.strip()}: {params_elem.text}. Error: {e}")
+        except ET.ParseError as e:
+            logger.error(f"XML parsing error for tool calls: {e}. Content: {response_content[:500]}")
+        except Exception as e:
+            logger.error(f"Unexpected error parsing tool calls: {e}. Content: {response_content[:500]}", exc_info=True)
+        return tool_calls
+
+    async def _execute_tool_call(self, tool_name: str, parameters: Dict[str, Any], current_config: Dict[str, Any]) -> str:
         logger.info(f"Attempting to execute tool: {tool_name} with parameters: {parameters}")
         tool_instance = self.tools.get(tool_name)
         if not tool_instance:
             return f"Error: Tool '{tool_name}' not found."
 
         try:
-            # Simplified execution based on tool name
-            # This part needs to be robust and aligned with how tools are designed/modified
+            tool_output: Any # Define tool_output to hold various types before string conversion
+
+            # Specific handling for search_file_knowledge
             if tool_name == "search_file_knowledge":
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_knowledge."
-                # The RAGFusionRetriever's search method is more comprehensive than a simple knowledge_search_method
-                # We'll use it and format its output.
-                search_results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=3, top_k_kg=2)
-                return self._format_search_results(search_results, subquery_limit=1) # Limit to 1 subquery for tool call
-            
+                
+                # knowledge_search_method returns AggregateSearchResult
+                tool_output_obj = await self.knowledge_search_method(query=query, agent_config=current_config) 
+                
+                # Format AggregateSearchResult object into a string for the LLM
+                formatted_output_parts = []
+                if tool_output_obj.chunk_search_results:
+                    formatted_output_parts.append("Chunk Results:")
+                    # Limit display using config, default to 2 if not set
+                    max_display = current_config.get("tool_max_chunk_results_display", 2)
+                    for idx, r in enumerate(tool_output_obj.chunk_search_results[:max_display]):
+                        doc_id_str = r.doc_id.replace('-', '')[:6] if r.doc_id else 'unknown'
+                        page_num_str = str(r.page_number) if r.page_number is not None else 'NA'
+                        chunk_idx_str = str(r.chunk_index_in_page) if r.chunk_index_in_page is not None else str(idx)
+                        source_id = f"c_{doc_id_str}_p{page_num_str}_i{chunk_idx_str}"
+                        
+                        text_snippet = r.text or 'N/A'
+                        if len(text_snippet) > 200: text_snippet = text_snippet[:197] + "..."
+                        
+                        score_val = r.rerank_score if r.rerank_score is not None else r.score
+                        score_disp = f"{score_val:.4f}" if score_val is not None else "N/A"
+                        formatted_output_parts.append(f"  Source ID [{source_id}]: {text_snippet} (Score: {score_disp})")
+                
+                if tool_output_obj.graph_search_results:
+                    formatted_output_parts.append("\nKnowledge Graph Results:")
+                    max_display = current_config.get("tool_max_kg_results_display", 2)
+                    for idx, kg_item in enumerate(tool_output_obj.graph_search_results[:max_display]):
+                        doc_id_str = kg_item.doc_id.replace('-', '')[:6] if kg_item.doc_id else 'unknown'
+                        page_num_str = str(kg_item.page_number) if kg_item.page_number is not None else 'NA'
+                        chunk_idx_str = str(kg_item.chunk_index_in_page) if kg_item.chunk_index_in_page is not None else str(idx)
+                        source_id = f"kg_{doc_id_str}_p{page_num_str}_i{chunk_idx_str}"
+                        
+                        entities_str = ", ".join([e.name for e in kg_item.entities[:2] if e.name])
+                        if len(kg_item.entities) > 2: entities_str += "..."
+                        
+                        rels_str = ", ".join([f"{r.source_entity}->{r.relation}->{r.target_entity}" for r in kg_item.relationships[:1] if r.source_entity and r.relation and r.target_entity])
+                        if len(kg_item.relationships) > 1: rels_str += "..."
+                        
+                        chunk_text_snippet = kg_item.chunk_text or ""
+                        if len(chunk_text_snippet) > 100: chunk_text_snippet = chunk_text_snippet[:97] + "..."
+                        formatted_output_parts.append(f"  Source ID [{source_id}]: Entities: [{entities_str or 'None'}]. Relationships: [{rels_str or 'None'}]. (Chunk: {chunk_text_snippet})")
+
+                if not formatted_output_parts:
+                    return "No relevant information found by search_file_knowledge."
+                return "\n".join(formatted_output_parts)
+
             elif tool_name == "search_file_descriptions":
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_descriptions."
-                # As noted, RAGFusionRetriever doesn't have a dedicated description search.
-                # We'll use its general search.
                 logger.warning("search_file_descriptions tool is using general RAG search, not a dedicated description search.")
-                search_results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=3, top_k_kg=0) # Focus on chunks
-                return self._format_search_results(search_results, subquery_limit=1)
+                # This method should ideally return something that can be formatted, perhaps a list of doc summaries.
+                # For now, using the agent's file_search_method which calls retriever.search
+                search_results_dict = await self.file_search_method(query=query, agent_config=current_config)
+                # Format this dict; _format_search_results is designed for the full retriever output.
+                # We might need a simpler formatter here or adapt file_search_method's return.
+                return self._format_search_results(search_results_dict, subquery_limit=1)
+
 
             elif tool_name == "get_file_content":
                 doc_id = parameters.get("document_id")
                 if not doc_id: return "Error: 'document_id' parameter missing for get_file_content."
-                # Simulate fetching content by querying RAG retriever for a specific doc_id
-                # This won't be the "full document" unless the document is small and fully chunked.
                 logger.warning(f"get_file_content tool is simulating full doc retrieval using RAG search for doc_id: {doc_id}.")
-                # Construct a query that might hit the document_id if it's in the text or metadata
-                query = f"Retrieve content for document ID {doc_id}"
-                # A more direct way would be to filter Elasticsearch if doc_id is a metadata field.
-                # For now, using the retriever's search:
-                search_results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=5, top_k_kg=0)
-                
-                # Filter results to only include those matching the doc_id (if retriever doesn't do exact match)
-                filtered_chunks_text = []
-                if search_results and "sub_queries_results" in search_results:
-                    for sq_res in search_results["sub_queries_results"]:
-                        for chunk in sq_res.get("reranked_chunks", []):
-                            if chunk.get("doc_id") == doc_id:
-                                filtered_chunks_text.append(chunk.get("text", ""))
-                
-                if filtered_chunks_text:
-                    return f"Content chunks for document ID '{doc_id}':\n\n" + "\n\n---\n\n".join(filtered_chunks_text)
-                else:
-                    return f"No specific content chunks found directly matching document ID '{doc_id}' through general search."
+                # This method should ideally return the full document content or a significant portion.
+                content_results_dict = await self.content_method(filters={"id": {"$eq": doc_id}}, agent_config=current_config)
+                # Format this dict.
+                return self._format_search_results(content_results_dict, subquery_limit=1) # Assuming similar structure for now
 
-            else:
-                # Fallback if direct mapping isn't implemented or tool has its own execute
-                if hasattr(tool_instance, 'execute') and asyncio.iscoroutinefunction(tool_instance.execute):
-                    # Ensure parameters are passed as keyword arguments
-                    tool_output = await tool_instance.execute(**parameters) 
-                elif hasattr(tool_instance, 'execute'): # Synchronous execute
-                     tool_output = tool_instance.execute(**parameters)
+            else: # Fallback for other tools or if direct mapping isn't implemented
+                if hasattr(tool_instance, 'execute'):
+                    if asyncio.iscoroutinefunction(tool_instance.execute):
+                        tool_output = await tool_instance.execute(**parameters)
+                    else: # Synchronous execute
+                        tool_output = tool_instance.execute(**parameters)
                 else:
                     return f"Error: Tool '{tool_name}' has no execute method."
-
-                if isinstance(tool_output, AggregateSearchResult):
-                    # Basic formatting for AggregateSearchResult
-                    # This might need to be more sophisticated depending on AggregateSearchResult structure
-                    formatted_output_parts = []
-                    if tool_output.chunk_search_results:
-                        formatted_output_parts.append("Chunk Results:\n" + json.dumps([r.dict() for r in tool_output.chunk_search_results[:2]], indent=2)) # Show first 2
-                    if tool_output.graph_search_results:
-                         formatted_output_parts.append("Graph Results:\n" + json.dumps([r.dict() for r in tool_output.graph_search_results[:2]], indent=2)) # Show first 2
-                    if tool_output.document_search_results: # For file description search
-                        formatted_output_parts.append("Document Description Results:\n" + json.dumps([r.dict() for r in tool_output.document_search_results[:2]], indent=2))
-
-                    return "\n".join(formatted_output_parts) if formatted_output_parts else "Tool executed, no specific results to format."
-                return str(tool_output) # Default to string representation
+            
+            # General string conversion for other tool outputs if they aren't AggregateSearchResult
+            # or haven't been handled specifically above.
+            if isinstance(tool_output, str):
+                return tool_output # Already a string
+            elif isinstance(tool_output, (dict, list)):
+                try:
+                    return json.dumps(tool_output, indent=2)
+                except TypeError:
+                    return str(tool_output) # Fallback if not JSON serializable
+            else:
+                return str(tool_output)
 
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
-            return f"Error during execution of tool {tool_name}: {str(e)}"
+            return f"Error: Failed to execute tool {tool_name}. Details: {str(e)}"
 
     async def arun(self, query: str, agent_config_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         current_config = {**self.config, **(agent_config_override or {})}
         current_llm_model = current_config.get("model", self.llm_model)
         current_max_iterations = current_config.get("max_iterations", self.max_iterations)
+        initial_retrieval_num_sq = current_config.get("initial_retrieval_subqueries", 2)
+        initial_retrieval_top_k_chunks = current_config.get("initial_retrieval_top_k_chunks", 3)
+        initial_retrieval_top_k_kg = current_config.get("initial_retrieval_top_k_kg", 2)
         
         logger.info(f"StaticResearchAgent starting 'arun' for query: \"{query}\" with model {current_llm_model}, max_iter={current_max_iterations}")
 
         messages: List[Dict[str, Any]] = []
         
-        # 1. Initial Retrieval
-        try:
-            initial_search_results = await self.retriever.search(
-                user_query=query, 
-                num_subqueries=2, # As per RAGFusionRetriever example
-                top_k_chunks=3, 
-                top_k_kg=2
-            )
-            formatted_initial_context = self._format_search_results(initial_search_results)
-        except Exception as e:
-            logger.error(f"Error during initial retrieval: {e}", exc_info=True)
-            formatted_initial_context = "Error: Could not perform initial information retrieval."
-
-        # 2. System Prompt Construction
-        # The static_research_agent.yaml prompt is the main system message.
-        # Tool definitions are appended to it.
-        # Date formatting for the prompt
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        # 1. Initial Retrieval (Optional, based on config)
+        initial_context = "No initial search performed." # Default
+        if current_config.get("perform_initial_retrieval", True):
+            try:
+                logger.info("Performing initial retrieval...")
+                initial_search_results = await self.retriever.search(
+                    user_query=query, 
+                    num_subqueries=initial_retrieval_num_sq,
+                    top_k_chunks=initial_retrieval_top_k_chunks, 
+                    top_k_kg=initial_retrieval_top_k_kg
+                )
+                initial_context = self._format_search_results(initial_search_results, subquery_limit=initial_retrieval_num_sq)
+                logger.debug(f"Initial context formatted (first 500 chars): {initial_context[:500]}")
+            except Exception as e:
+                logger.error(f"Error during initial retrieval: {e}", exc_info=True)
+                initial_context = "Error during initial search."
         
-        system_prompt_content = self.prompt_template_str.format(date=current_date) + "\n\n" + self.tool_system_prompt
-        messages.append({"role": "system", "content": system_prompt_content})
+        # 2. Prepare System Prompt
+        # Assuming date is passed or obtained somehow; for now, a placeholder.
+        current_date_str = current_config.get("current_date", "today") # Could be dynamic
+        
+        # Construct tool definitions string for the prompt
+        tool_definitions_str = "<AvailableTools>\n"
+        for tool_name, tool_instance in self.tools.items():
+            tool_definitions_str += f"  <ToolDefinition>\n"
+            tool_definitions_str += f"    <Name>{tool_instance.name}</Name>\n"
+            tool_definitions_str += f"    <Description>{tool_instance.description}</Description>\n"
+            # Parameters need to be in the specific XML format expected by the prompt
+            # Assuming tool_instance.parameters is a JSON schema dict
+            params_xml = "    <Parameters>\n"
+            if tool_instance.parameters and "properties" in tool_instance.parameters:
+                for param_name, param_details in tool_instance.parameters["properties"].items():
+                    param_type = param_details.get("type", "string")
+                    param_desc = param_details.get("description", "")
+                    required = param_name in tool_instance.parameters.get("required", [])
+                    params_xml += f'      <Parameter name="{param_name}" type="{param_type}" required="{str(required).lower()}">{param_desc}</Parameter>\n'
+            params_xml += "    </Parameters>\n"
+            tool_definitions_str += params_xml
+            tool_definitions_str += f"  </ToolDefinition>\n"
+        tool_definitions_str += "</AvailableTools>"
 
-        # 3. Add Initial Context as Assistant Message
-        messages.append({"role": "assistant", "content": f"I have performed an initial search. Here's what I found:\n{formatted_initial_context}"})
-
-        # 4. Add User Query
+        system_prompt = self.system_prompt_template.format(
+            date=current_date_str,
+            initial_context=initial_context, # Pass initial search results into the system prompt
+            tool_definitions=tool_definitions_str # Pass tool definitions
+        )
+        messages.append({"role": "system", "content": system_prompt})
+        
+        # 3. Add User Query
         messages.append({"role": "user", "content": query})
 
-        # 5. Main Interaction Loop
+        # 4. Main Interaction Loop
         iterations_count = 0
         while iterations_count < current_max_iterations:
             iterations_count += 1
             logger.info(f"Agent Iteration {iterations_count}/{current_max_iterations}")
             
-            if logger.isEnabledFor(logging.DEBUG): # Avoid expensive ops if not debugging
-                 logger.debug(f"Messages to LLM:\n{json.dumps(messages, indent=2)}")
+            if logger.isEnabledFor(logging.DEBUG):
+                 logger.debug(f"Messages to LLM:\n{json.dumps(messages, indent=2, default=str)}")
 
             try:
                 llm_response = await self.llm_client.chat.completions.create(
                     model=current_llm_model,
                     messages=messages,
-                    temperature=0.2, # Lower temperature for more factual/tool-driven responses
-                    # max_tokens can be set if needed
+                    temperature=current_config.get("temperature", 0.2),
+                    max_tokens=current_config.get("max_tokens_llm_response", 1500) 
                 )
             except Exception as e:
                 logger.error(f"OpenAI API call failed: {e}", exc_info=True)
@@ -369,149 +398,176 @@ class StaticResearchAgent:
             logger.debug(f"LLM Raw Response Content:\n{response_content}")
             logger.debug(f"LLM Finish Reason: {finish_reason}")
 
-            # Append LLM's response (which might contain tool calls or final answer)
-            # If it contains tool calls, we'll add it as assistant's turn before tool results.
-            # If it's a final answer, this is the message we'll return.
             current_assistant_response_message = {"role": "assistant", "content": response_content}
             
-            # Check for tool calls in the response content (XML parsing)
             parsed_tool_calls = self._parse_llm_tool_calls(response_content)
 
             if parsed_tool_calls:
                 logger.info(f"LLM requested tool calls: {parsed_tool_calls}")
-                messages.append(current_assistant_response_message) # Add the message that contained the tool call
+                messages.append(current_assistant_response_message) 
                 
-                all_tool_results_appended = True
                 for tool_call in parsed_tool_calls:
                     tool_name = tool_call["tool_name"]
                     tool_params = tool_call["parameters"]
                     
-                    # Using a generic tool_call_id as we are not using OpenAI's native tool_calls array
-                    # This ID is mostly for structuring the conversation history.
-                    tool_call_id_for_history = f"tool_call_{iterations_count}_{tool_name}" 
-
-                    tool_result_str = await self._execute_tool_call(tool_name, tool_params)
+                    tool_result_str = await self._execute_tool_call(tool_name, tool_params, current_config)
                     
-                    # Append tool result message
-                    # Note: OpenAI's native tool usage expects `tool_call_id` and `name` in the tool message.
-                    # Since we parse from content, we simulate this structure.
                     messages.append({
                         "role": "tool", 
-                        # "tool_call_id": tool_call_id_for_history, # Not strictly needed if LLM doesn't use it
-                        "name": tool_name, # Function name
-                        "content": tool_result_str
+                        "name": tool_name, 
+                        "content": tool_result_str 
                     })
                     logger.debug(f"Appended tool result for {tool_name}: {tool_result_str[:200]}...")
-                
-                # If finish_reason was 'stop' but there were tool calls, we continue to process tools.
-                # If finish_reason was specific to tool usage (like 'tool_calls' if OpenAI ever uses that for content-parsed tools),
-                # we also continue.
-                # The primary driver is whether parsed_tool_calls is not empty.
-                # Loop will continue to get LLM's next thought after tool execution.
-
-            else: # No tool calls parsed
+            else: 
                 if finish_reason == "stop":
                     logger.info("LLM indicated 'stop' and no tool calls parsed. Returning final answer.")
-                    # The current_assistant_response_message is the final answer
-                    messages.append(current_assistant_response_message) # Ensure final answer is in history
+                    messages.append(current_assistant_response_message)
                     return {"answer": response_content, "history": messages}
-                elif response_content: # LLM provided content, no tool calls, but finish_reason wasn't 'stop' (e.g. 'length')
+                elif response_content: 
                     logger.warning(f"LLM provided content but finish_reason was '{finish_reason}' and no tool calls. Assuming it's a partial/final answer.")
                     messages.append(current_assistant_response_message)
                     return {"answer": response_content, "history": messages, "warning": f"Finished due to {finish_reason}"}
-                else: # No content and no tool calls, unusual state
+                else: 
                     logger.error(f"LLM stopped for reason '{finish_reason}' without tool calls or content.")
-                    messages.append(current_assistant_response_message) # Log what was (not) said
+                    messages.append(current_assistant_response_message) 
                     return {"answer": "Agent could not produce a final answer.", "error": f"LLM stopped unexpectedly: {finish_reason}", "history": messages}
         
         logger.warning(f"Max iterations ({current_max_iterations}) reached.")
-        # Return the last piece of content the LLM generated, if any, or an error.
         last_llm_content = messages[-1]["content"] if messages and messages[-1]["role"] == "assistant" else "Max iterations reached without a conclusive answer."
         return {"answer": last_llm_content, "history": messages, "warning": "Max iterations reached"}
 
     # --- Methods for tools to call if agent is their context ---
-    # These are simplified proxies or would need full implementation if tools strictly
-    # rely on the R2R app-like context methods.
-    async def knowledge_search_method(self, query: str, settings: Optional[Any] = None):
-        # This is what SearchFileKnowledgeTool expects.
-        # We map it to the retriever's search.
+    async def knowledge_search_method(self, query: str, agent_config: Optional[Dict[str, Any]] = None) -> AggregateSearchResult:
+        effective_config = agent_config or self.config # Use passed config or agent's default
         logger.debug(f"Agent's knowledge_search_method called with query: {query}")
-        # `settings` from tool context is not directly used here, RAGFusionRetriever has its own params.
-        results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=3, top_k_kg=2)
-        # The tool expects AggregateSearchResult or a dict. RAGFusionRetriever returns a dict.
-        # We need to map it or ensure the tool can handle this dict.
-        # For now, returning the dict and the tool's execute method will format it.
-        return results # This will be a dict like RAGFusionRetriever.search output
+        
+        num_sq = effective_config.get("tool_num_subqueries", 1)
+        top_k_c = effective_config.get("tool_top_k_chunks", 3)
+        top_k_kg_val = effective_config.get("tool_top_k_kg", 2)
 
-    async def file_search_method(self, query: str, settings: Optional[Any] = None):
-        # For SearchFileDescriptionsTool
+        raw_results_dict = await self.retriever.search(
+            user_query=query, 
+            num_subqueries=num_sq,
+            top_k_chunks=top_k_c,
+            top_k_kg=top_k_kg_val
+        )
+
+        agg_result = AggregateSearchResult(query=query)
+        
+        if raw_results_dict and "sub_queries_results" in raw_results_dict:
+            for sq_res in raw_results_dict["sub_queries_results"]:
+                for chunk_data in sq_res.get("reranked_chunks", []):
+                    # Ensure all keys expected by ChunkSearchResult are present or have defaults
+                    mapped_chunk_data = {
+                        "text": chunk_data.get("text"),
+                        "score": chunk_data.get("score"),
+                        "rerank_score": chunk_data.get("rerank_score"),
+                        "file_name": chunk_data.get("file_name"),
+                        "doc_id": chunk_data.get("doc_id"),
+                        "page_number": chunk_data.get("page_number"),
+                        "chunk_index_in_page": chunk_data.get("chunk_index_in_page"),
+                    }
+                    agg_result.chunk_search_results.append(ChunkSearchResult(**mapped_chunk_data))
+                
+                for kg_data_item in sq_res.get("retrieved_kg_data", []):
+                    entities = [KGEntity(**e_data) for e_data in kg_data_item.get("entities", [])]
+                    relationships = [KGRelationship(**r_data) for r_data in kg_data_item.get("relationships", [])]
+                    
+                    mapped_kg_data = {
+                        "chunk_text": kg_data_item.get("chunk_text"),
+                        "entities": entities,
+                        "relationships": relationships,
+                        "score": kg_data_item.get("score"),
+                        "rerank_score": kg_data_item.get("rerank_score"), # Though KG not typically reranked by score
+                        "file_name": kg_data_item.get("file_name"),
+                        "doc_id": kg_data_item.get("doc_id"),
+                        "page_number": kg_data_item.get("page_number"),
+                        "chunk_index_in_page": kg_data_item.get("chunk_index_in_page"),
+                    }
+                    agg_result.graph_search_results.append(KGSearchResult(**mapped_kg_data))
+        return agg_result
+
+    async def file_search_method(self, query: str, agent_config: Optional[Dict[str, Any]] = None):
+        effective_config = agent_config or self.config
         logger.debug(f"Agent's file_search_method called with query: {query}")
-        results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=3, top_k_kg=0) # Focus on text
-        # This also returns the RAGFusionRetriever's dict format.
-        # The tool expects a list of DocumentFragment. This is a mismatch.
-        # The _execute_tool_call handles formatting for now.
+        # This tool is for descriptions, so focus on text chunks, less on KG.
+        results = await self.retriever.search(
+            user_query=query, 
+            num_subqueries=effective_config.get("tool_file_search_subqueries", 1), 
+            top_k_chunks=effective_config.get("tool_file_search_top_k_chunks", 5), 
+            top_k_kg=0 # No KG for file description search
+        )
         return results 
 
-    async def content_method(self, filters: Dict, options: Optional[Dict] = None):
-        # For GetFileContentTool
+    async def content_method(self, filters: Dict, agent_config: Optional[Dict[str, Any]] = None, options: Optional[Dict] = None):
+        effective_config = agent_config or self.config
         logger.debug(f"Agent's content_method called with filters: {filters}")
-        doc_id_filter = filters.get("id", {}).get("$eq")
+        doc_id_filter = filters.get("id", {}).get("$eq") # Assuming filter format like {"id": {"$eq": "doc_id_value"}}
         if doc_id_filter:
-            # Simulate by searching for this doc_id
-            query = f"Retrieve all content for document ID {doc_id_filter}"
-            results = await self.retriever.search(user_query=query, num_subqueries=1, top_k_chunks=10, top_k_kg=0) # Get more chunks
-            # This needs significant adaptation if the tool expects full Document objects.
-            # _execute_tool_call handles formatting.
+            # Simulate by searching for this doc_id, get more chunks
+            query = f"Retrieve all content for document ID {doc_id_filter}" 
+            results = await self.retriever.search(
+                user_query=query, 
+                num_subqueries=1, # Focus on the specific doc
+                top_k_chunks=effective_config.get("tool_content_top_k_chunks", 10), 
+                top_k_kg=0 # Less emphasis on KG for "get content"
+            )
             return results
-        return {"error": "Document ID filter not correctly processed by agent's content_method"}
+        return {"error": "Document ID filter not correctly processed or missing in agent's content_method"}
 
     @property
-    def search_settings(self): # Property tools might look for in context
-        return {} # Placeholder
+    def search_settings(self): 
+        # This might be used by tools if they expect a specific settings object.
+        # For now, RAGFusionRetriever parameters are controlled via its method calls.
+        return {
+            "dummy_setting": "placeholder_value" 
+            # Add actual relevant settings if tools evolve to use this
+        }
 
-
-async def main_example_agent_run():
-    # Ensure root logger is configured if no handlers are present
+async def main_research_agent_example():
     if not logging.getLogger().hasHandlers():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Set specific logger levels
     logging.getLogger("src.core.agents.static_research_agent").setLevel(logging.DEBUG)
-    logging.getLogger("src.core.retrieval.rag_fusion_retriever").setLevel(logging.INFO) # Keep retriever less verbose unless debugging it
+    logging.getLogger("src.core.retrieval.rag_fusion_retriever").setLevel(logging.INFO) # Keep retriever a bit quieter for agent logs
 
     try:
         agent = StaticResearchAgent()
+        
+        # Example query
+        # query = "What are the recent advancements in quantum computing and their potential impact on cryptography?"
+        query = input("Enter your research query for the StaticResearchAgent: ").strip()
+        if not query:
+            print("No query entered. Exiting.")
+            return
+
+        print(f"\n--- Running StaticResearchAgent for query: '{query}' ---")
+        result = await agent.arun(query)
+        
+        print("\n--- Agent's Final Answer ---")
+        print(result.get("answer", "No answer provided."))
+        
+        if result.get("warning"):
+            print(f"\nWarning: {result['warning']}")
+        if result.get("error"):
+            print(f"\nError: {result['error']}")
+
+        if logger.isEnabledFor(logging.DEBUG) and result.get("history"):
+            print("\n--- Full Conversation History (Debug) ---")
+            print(json.dumps(result["history"], indent=2, default=str))
+
+    except ValueError as ve:
+        logger.error(f"Initialization error for StaticResearchAgent: {ve}")
     except Exception as e:
-        logger.critical(f"Failed to initialize StaticResearchAgent: {e}", exc_info=True)
-        return
-
-    user_query = input("Enter your research query: ").strip()
-    if not user_query:
-        logger.warning("No query entered. Exiting.")
-        return
-
-    logger.info(f"\n--- Running Static Research Agent for: '{user_query}' ---")
-    
-    results = await agent.arun(user_query)
-    
-    print("\n\n--- Agent Final Response ---")
-    print(results.get("answer", "No answer provided."))
-    
-    if results.get("warning"):
-        print(f"\nWarning: {results.get('warning')}")
-    if results.get("error"):
-        print(f"\nError: {results.get('error')}")
-
-    # Optionally print full history for debugging
-    # print("\n--- Full Conversation History ---")
-    # print(json.dumps(results.get("history", []), indent=2))
-
-    # Clean up (if clients were created in agent, not module-level)
-    # Since RAGFusionRetriever uses module-level clients, they are closed by its own __main__ or pipeline_coordinator
-    # The agent's own OpenAI client is instance-level.
-    if agent.llm_client and hasattr(agent.llm_client, "close"): # AsyncOpenAI client doesn't have close, it uses atexit
-        pass # await agent.llm_client.close() 
-
+        logger.error(f"An error occurred during the agent example run: {e}", exc_info=True)
+    finally:
+        # Clean up clients if they were created by the agent's default constructor
+        if hasattr(agent, 'llm_client') and isinstance(agent.llm_client, AsyncOpenAI):
+             if hasattr(agent.llm_client, "aclose"): await agent.llm_client.aclose()
+        if hasattr(agent, 'retriever') and hasattr(agent.retriever, 'es_client') and agent.retriever.es_client:
+             if hasattr(agent.retriever.es_client, "close"): await agent.retriever.es_client.close()
+        # Note: RAGFusionRetriever's OpenAI client is shared (aclient_openai module global),
+        # it should be closed at the application's very end if created globally.
+        # If agent created its own retriever which created its own clients, they'd be closed above.
 
 if __name__ == "__main__":
-    asyncio.run(main_example_agent_run())
+    asyncio.run(main_research_agent_example())
