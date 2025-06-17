@@ -29,7 +29,7 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_BASE_DIMENSION", 3072))
 
-ELASTICSEARCH_INDEX_CHUNKS = os.getenv("ELASTICSEARCH_INDEX_CHUNKS", "r2rtest0") 
+ELASTICSEARCH_INDEX_CHUNKS = os.getenv("ELASTICSEARCH_INDEX_CHUNKS", "r2rtest003") 
 
 CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE", 3072)) 
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP", 512))
@@ -142,121 +142,194 @@ class ChunkingEmbeddingPDFProcessor:
             logger.error(f"Error loading prompt '{prompt_name}': {e}")
             raise
 
+    def _clean_xml_string(self, xml_string: str) -> str:
+        """Cleans the XML string from common LLM artifacts and prepares it for parsing."""
+        if not isinstance(xml_string, str):
+            logger.warning(f"XML input is not a string, type: {type(xml_string)}. Returning empty string.")
+            return ""
+
+        # 1. Strip leading/trailing whitespace
+        cleaned_xml = xml_string.strip()
+
+        # 2. Remove markdown code blocks (```xml ... ``` or ``` ... ```)
+        if cleaned_xml.startswith("```xml"):
+            cleaned_xml = cleaned_xml[len("```xml"):].strip()
+        elif cleaned_xml.startswith("```"):
+            cleaned_xml = cleaned_xml[len("```"):].strip()
+        
+        if cleaned_xml.endswith("```"):
+            cleaned_xml = cleaned_xml[:-len("```")].strip()
+
+        # 3. Remove XML declaration (<?xml ... ?>)
+        if cleaned_xml.startswith("<?xml"):
+            end_decl = cleaned_xml.find("?>")
+            if end_decl != -1:
+                cleaned_xml = cleaned_xml[end_decl + 2:].lstrip()
+        
+        # 4. Attempt to extract content between the first '<' and last '>'
+        # This helps if the LLM added conversational text around the XML.
+        first_angle_bracket = cleaned_xml.find("<")
+        last_angle_bracket = cleaned_xml.rfind(">")
+
+        if first_angle_bracket != -1 and last_angle_bracket != -1 and last_angle_bracket > first_angle_bracket:
+            cleaned_xml = cleaned_xml[first_angle_bracket : last_angle_bracket + 1]
+        elif first_angle_bracket == -1 : # No XML tags found
+            logger.warning(f"No XML tags found in the string after initial cleaning. Original: {xml_string[:200]}")
+            return ""
+
+
+        # 5. Escape standalone ampersands (common issue)
+        # This regex finds '&' that are not part of a valid XML entity.
+        cleaned_xml = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', cleaned_xml)
+
+        # 6. Remove common non-XML prefixes/suffixes if they somehow survived
+        # (More of a safeguard, primary extraction is via angle brackets)
+        common_prefixes = ["Sure, here is the XML:", "Here's the XML output:", "Okay, here's the XML:"]
+        for prefix in common_prefixes:
+            if cleaned_xml.lower().startswith(prefix.lower()):
+                cleaned_xml = cleaned_xml[len(prefix):].lstrip()
+                break
+        
+        # 7. Remove control characters except for \t, \n, \r
+        # XML 1.0 spec: Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+        # This regex removes characters not in the allowed ranges.
+        cleaned_xml = re.sub(r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]', '', cleaned_xml)
+
+        return cleaned_xml
+
     def _parse_graph_xml(self, xml_string: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         entities = []
         relationships = []
-        string_to_parse_for_log = "" 
+        
+        cleaned_xml = self._clean_xml_string(xml_string)
+
+        if not cleaned_xml:
+            logger.warning("XML string is empty after cleaning. Cannot parse.")
+            return entities, relationships
+
+        # Ensure a single root element for ET.fromstring()
+        # Common root tags LLM might use: <graph>, <data>, <root>, <entities>, <response>
+        # If none of these, or if it doesn't look like a single root, wrap it.
+        # Check if the string starts with a common root tag and appears to end with its corresponding closing tag.
+        has_known_root = False
+        known_roots = ["<graph>", "<root>", "<entities>", "<response>", "<data>"]
+        for root_tag_start in known_roots:
+            if cleaned_xml.startswith(root_tag_start):
+                root_tag_name = root_tag_start[1:-1] # e.g., "graph"
+                if cleaned_xml.endswith(f"</{root_tag_name}>"):
+                    has_known_root = True
+                    break
+        
+        string_to_parse = cleaned_xml
+        if not has_known_root:
+            # If it's just a list of <entity> or <relationship> tags, or doesn't look like it has a single root
+            if (cleaned_xml.startswith("<entity") or cleaned_xml.startswith("<relationship")) and \
+               (cleaned_xml.endswith("</entity>") or cleaned_xml.endswith("</relationship>")):
+                string_to_parse = f"<root_wrapper>{cleaned_xml}</root_wrapper>"
+                logger.debug("Wrapping multiple top-level entity/relationship tags with <root_wrapper>.")
+            # A very basic check: if it doesn't have a clear start/end tag structure for a single root
+            elif not (cleaned_xml.count("<") > 1 and cleaned_xml.count(">") > 1 and cleaned_xml.find("</") > 0 and cleaned_xml.startswith("<") and cleaned_xml.endswith(">") and cleaned_xml[1:cleaned_xml.find(">") if cleaned_xml.find(">") > 1 else 0].strip() == cleaned_xml[cleaned_xml.rfind("</")+2:-1].strip() ):
+                 string_to_parse = f"<root_wrapper>{cleaned_xml}</root_wrapper>"
+                 logger.debug("Wrapping content with <root_wrapper> as it doesn't appear to have a single root or matching end tag.")
+        
         try:
-            stripped_xml = xml_string.strip()
-            if stripped_xml.startswith("```xml"):
-                stripped_xml = stripped_xml[len("```xml"):].strip()
-            elif stripped_xml.startswith("```"): 
-                stripped_xml = stripped_xml[len("```"):].strip()
+            root = ET.fromstring(string_to_parse)
             
-            if stripped_xml.endswith("```"):
-                stripped_xml = stripped_xml[:-len("```")].strip()
-
-            if stripped_xml.startswith("<?xml"):
-                end_decl = stripped_xml.find("?>")
-                if end_decl != -1:
-                    stripped_xml = stripped_xml[end_decl + 2:].lstrip()
-            
-            if not stripped_xml:
-                logger.warning("Empty XML string after stripping common artifacts and XML declaration.")
-                return [], []
-
-            first_tag_start = stripped_xml.find("<")
-            if first_tag_start == -1:
-                logger.warning(f"No '<' (start of tag) found in XML string after stripping: {stripped_xml[:200]}...")
-                return [], []
-            
-            content_to_parse = stripped_xml[first_tag_start:]
-            if not content_to_parse.startswith("<root>") and not content_to_parse.startswith("<graph>"): 
-                 string_to_parse_for_log = f"<root_wrapper>{content_to_parse}</root_wrapper>"
-            else:
-                 string_to_parse_for_log = content_to_parse
-            
-            try:
-                root = ET.fromstring(string_to_parse_for_log)
+            for entity_elem in root.findall(".//entity"): 
+                name_val = entity_elem.get("name") # Prefer attribute if present
+                if not name_val: # Fallback to <name> sub-element
+                    name_elem = entity_elem.find("name")
+                    name_val = name_elem.text.strip() if name_elem is not None and name_elem.text else None
                 
-                for entity_elem in root.findall(".//entity"): 
-                    name = entity_elem.get("name")
-                    ent_type_elem = entity_elem.find("type")
-                    ent_desc_elem = entity_elem.find("description")
-                    ent_type = ent_type_elem.text.strip() if ent_type_elem is not None and ent_type_elem.text else "Unknown"
-                    ent_desc = ent_desc_elem.text.strip() if ent_desc_elem is not None and ent_desc_elem.text else ""
-                    if name:
-                        entities.append({"name": name.strip(), "type": ent_type, "description": ent_desc})
-
-                for rel_elem in root.findall(".//relationship"): 
-                    source_elem = rel_elem.find("source")
-                    target_elem = rel_elem.find("target")
-                    rel_type_elem = rel_elem.find("type")
-                    rel_desc_elem = rel_elem.find("description")
-                    rel_weight_elem = rel_elem.find("weight")
-                    source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
-                    target = target_elem.text.strip() if target_elem is not None and target_elem.text else None
-                    rel_type = rel_type_elem.text.strip() if rel_type_elem is not None and rel_type_elem.text else "RELATED_TO"
-                    rel_desc = rel_desc_elem.text.strip() if rel_desc_elem is not None and rel_desc_elem.text else ""
-                    weight = None
-                    if rel_weight_elem is not None and rel_weight_elem.text:
-                        try:
-                            weight = float(rel_weight_elem.text.strip())
-                        except ValueError:
-                            logger.warning(f"Could not parse relationship weight '{rel_weight_elem.text}' as float.")
-                    if source and target:
-                        relationships.append({
-                            "source_entity": source, "target_entity": target, "relation": rel_type,
-                            "relationship_description": rel_desc, "relationship_weight": weight
-                        })
+                ent_type_elem = entity_elem.find("type")
+                ent_desc_elem = entity_elem.find("description")
                 
-            except ET.ParseError as e:
-                err_line, err_col = e.position
-                log_message = (
-                    f"XML parsing error: {e}\n"
-                    f"Error at line {err_line}, column {err_col}. Trying regex-based extraction as fallback.\n"
-                    f"Original XML content snippet: {xml_string[:500]}"
-                )
-                logger.warning(log_message)
+                ent_type = ent_type_elem.text.strip() if ent_type_elem is not None and ent_type_elem.text else "Unknown"
+                ent_desc = ent_desc_elem.text.strip() if ent_desc_elem is not None and ent_desc_elem.text else ""
                 
-                entities = [] 
-                relationships = [] 
+                if name_val:
+                    entities.append({"name": name_val.strip(), "type": ent_type, "description": ent_desc})
 
-                entity_pattern = r'<entity\s+name="([^"]+)"\s*>(?:<type>([^<]+)</type>)?(?:<description>([^<]+)</description>)?</entity>'
-                for match in re.finditer(entity_pattern, content_to_parse): 
+            for rel_elem in root.findall(".//relationship"): 
+                source_elem = rel_elem.find("source")
+                target_elem = rel_elem.find("target")
+                rel_type_elem = rel_elem.find("type")
+                rel_desc_elem = rel_elem.find("description")
+                rel_weight_elem = rel_elem.find("weight")
+                
+                source = source_elem.text.strip() if source_elem is not None and source_elem.text else None
+                target = target_elem.text.strip() if target_elem is not None and target_elem.text else None
+                rel_type = rel_type_elem.text.strip() if rel_type_elem is not None and rel_type_elem.text else "RELATED_TO"
+                rel_desc = rel_desc_elem.text.strip() if rel_desc_elem is not None and rel_desc_elem.text else ""
+                weight = None
+                if rel_weight_elem is not None and rel_weight_elem.text:
+                    try:
+                        weight = float(rel_weight_elem.text.strip())
+                    except ValueError:
+                        logger.warning(f"Could not parse relationship weight '{rel_weight_elem.text}' as float.")
+                
+                if source and target:
+                    relationships.append({
+                        "source_entity": source, "target_entity": target, "relation": rel_type,
+                        "relationship_description": rel_desc, "relationship_weight": weight
+                    })
+            
+            logger.debug(f"Successfully parsed {len(entities)} entities and {len(relationships)} relationships using ET.fromstring.")
+
+        except ET.ParseError as e:
+            err_line, err_col = e.position if hasattr(e, 'position') else (-1, -1)
+            log_message = (
+                f"XML parsing error with ET.fromstring: {e}\n"
+                f"Error at line {err_line}, column {err_col} (approximate). Trying regex-based extraction as fallback.\n"
+                f"Cleaned XML snippet attempted (first 1000 chars):\n{string_to_parse[:1000]}"
+            )
+            logger.warning(log_message)
+            
+            # Regex fallback (kept as a last resort)
+            entities = [] 
+            relationships = [] 
+
+            entity_pattern_attr = r'<entity\s+name\s*=\s*"([^"]*)"\s*>\s*(?:<type>([^<]*)</type>)?\s*(?:<description>([^<]*)</description>)?\s*</entity>'
+            entity_pattern_tag = r'<entity>\s*<name>([^<]+)</name>\s*(?:<type>([^<]*)</type>)?\s*(?:<description>([^<]*)</description>)?\s*</entity>'
+
+
+            for pattern in [entity_pattern_attr, entity_pattern_tag]:
+                for match in re.finditer(pattern, string_to_parse): 
                     name, entity_type, description = match.groups()
-                    if name:
+                    if name: # Ensure name is captured
                         entities.append({
                             "name": name.strip(),
-                            "type": entity_type.strip() if entity_type else "Unknown",
-                            "description": description.strip() if description else ""
-                        })
-                
-                rel_pattern = r'<relationship>(?:<source>([^<]+)</source>)?(?:<target>([^<]+)</target>)?(?:<type>([^<]+)</type>)?(?:<description>([^<]+)</description>)?(?:<weight>([^<]+)</weight>)?</relationship>'
-                for match in re.finditer(rel_pattern, content_to_parse): 
-                    source, target, rel_type, description, weight_str = match.groups()
-                    if source and target:
-                        weight = None
-                        if weight_str:
-                            try:
-                                weight = float(weight_str.strip())
-                            except ValueError:
-                                pass
-                        
-                        relationships.append({
-                            "source_entity": source.strip(),
-                            "target_entity": target.strip(),
-                            "relation": rel_type.strip() if rel_type else "RELATED_TO",
-                            "relationship_description": description.strip() if description else "",
-                            "relationship_weight": weight
+                            "type": entity_type.strip() if entity_type and entity_type.strip() else "Unknown",
+                            "description": description.strip() if description and description.strip() else ""
                         })
             
-            logger.debug(f"Parsed {len(entities)} entities and {len(relationships)} relationships from XML.")
+            rel_pattern = r'<relationship>\s*(?:<source>([^<]+)</source>)?\s*(?:<target>([^<]+)</target>)?\s*(?:<type>([^<]*)</type>)?\s*(?:<description>([^<]*)</description>)?\s*(?:<weight>([^<]*)</weight>)?\s*</relationship>'
+            for match in re.finditer(rel_pattern, string_to_parse): 
+                source, target, rel_type, description, weight_str = match.groups()
+                if source and target: # Ensure source and target are captured
+                    weight = None
+                    if weight_str and weight_str.strip():
+                        try:
+                            weight = float(weight_str.strip())
+                        except ValueError:
+                            logger.debug(f"Regex fallback: Could not parse weight '{weight_str}' for relationship.")
+                    
+                    relationships.append({
+                        "source_entity": source.strip(),
+                        "target_entity": target.strip(),
+                        "relation": rel_type.strip() if rel_type and rel_type.strip() else "RELATED_TO",
+                        "relationship_description": description.strip() if description and description.strip() else "",
+                        "relationship_weight": weight
+                    })
+            if entities or relationships:
+                 logger.info(f"Regex fallback extracted {len(entities)} entities and {len(relationships)} relationships.")
+            else:
+                 logger.warning("Regex fallback also failed to extract any entities or relationships.")
         
-        except Exception as e: 
-            logger.error(f"An unexpected error occurred during XML parsing: {e}\n"
+        except Exception as final_e: 
+            logger.error(f"An unexpected error occurred during XML parsing (after ET.ParseError or during regex): {final_e}\n"
                         f"Original XML content from LLM (first 500 chars):\n{xml_string[:500]}\n"
-                        f"Content attempted for parsing (if available):\n{string_to_parse_for_log}", exc_info=True)
+                        f"Cleaned XML attempted for parsing (first 500 chars):\n{string_to_parse[:500]}", exc_info=True)
         
         return entities, relationships
 
@@ -278,15 +351,19 @@ class ChunkingEmbeddingPDFProcessor:
             response = await aclient_openai.chat.completions.create(
                 model=OPENAI_CHAT_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are an expert assistant that extracts entities and relationships from text and formats them as XML according to the provided schema. Ensure all tags are correctly opened and closed."},
+                    {"role": "system", "content": "You are an expert assistant that extracts entities and relationships from text and formats them as XML according to the provided schema. Ensure all tags are correctly opened and closed. Use <entity name=\"...\"><type>...</type><description>...</description></entity> and <relationship><source>...</source><target>...</target><type>...</type><description>...</description><weight>...</weight></relationship> format. Wrap multiple entities and relationships in a single <root> or <graph> tag."},
                     {"role": "user", "content": formatted_prompt}
                 ],
                 temperature=0.1, 
                 max_tokens=4000 
             )
-            xml_response = response.choices[0].message.content.strip()
-            logger.debug(f"Raw XML response from LLM for chunk-level graph extraction (first 500 chars):\n{xml_response[:500]}")
-            return self._parse_graph_xml(xml_response)
+            xml_response_content = response.choices[0].message.content
+            if not xml_response_content:
+                logger.warning("LLM returned empty content for graph extraction.")
+                return [], []
+            
+            logger.debug(f"Raw XML response from LLM for chunk-level graph extraction (first 500 chars):\n{xml_response_content[:500]}")
+            return self._parse_graph_xml(xml_response_content)
         except Exception as e:
             logger.error(f"Error during chunk-level graph extraction API call or parsing: {e}", exc_info=True)
             return [], []
@@ -318,7 +395,12 @@ class ChunkingEmbeddingPDFProcessor:
                 temperature=0.3, 
                 max_tokens=min(CHUNK_SIZE_TOKENS + CHUNK_OVERLAP_TOKENS, 4000) 
             )
-            enriched_text = response.choices[0].message.content.strip()
+            enriched_text_content = response.choices[0].message.content
+            if not enriched_text_content:
+                logger.warning("LLM returned empty content for chunk enrichment. Using original chunk.")
+                return chunk_text
+            
+            enriched_text = enriched_text_content.strip()
             logger.debug(f"Chunk enriched. Original length: {len(chunk_text)}, Enriched length: {len(enriched_text)}")
             return enriched_text
         except Exception as e:
@@ -344,7 +426,12 @@ class ChunkingEmbeddingPDFProcessor:
                 temperature=0.3,
                 max_tokens=SUMMARY_MAX_TOKENS 
             )
-            summary_text = response.choices[0].message.content.strip()
+            summary_text_content = response.choices[0].message.content
+            if not summary_text_content:
+                logger.warning("LLM returned empty content for document summary.")
+                return "Summary generation resulted in empty content."
+
+            summary_text = summary_text_content.strip()
             logger.info(f"Document summary generated. Length: {len(summary_text)} chars.")
             return summary_text
         except Exception as e:
@@ -419,12 +506,22 @@ class ChunkingEmbeddingPDFProcessor:
         preceding_texts = [all_raw_texts[i] for i in preceding_indices]
         succeeding_texts = [all_raw_texts[i] for i in succeeding_indices]
 
+        # Use the more detailed llm_generated_doc_summary for KG and enrichment if available,
+        # otherwise fallback to user_provided_doc_summary.
+        contextual_summary = llm_generated_doc_summary
+        if not llm_generated_doc_summary or \
+           llm_generated_doc_summary == "Document is empty, no summary generated." or \
+           llm_generated_doc_summary.startswith("Error during summary generation") or \
+           llm_generated_doc_summary == "Summary generation skipped due to missing configuration.":
+            contextual_summary = user_provided_doc_summary
+
+
         kg_task = asyncio.create_task(
-            self._extract_knowledge_graph(chunk_text, user_provided_doc_summary)
+            self._extract_knowledge_graph(chunk_text, contextual_summary)
         )
         enrich_task = asyncio.create_task(
             self._enrich_chunk_content(
-                chunk_text, user_provided_doc_summary, preceding_texts, succeeding_texts
+                chunk_text, contextual_summary, preceding_texts, succeeding_texts
             )
         )
 
@@ -464,7 +561,7 @@ class ChunkingEmbeddingPDFProcessor:
             "doc_id": doc_id,
             "page_number": page_num,
             "chunk_index_in_page": chunk_idx_on_page,
-            "document_summary": llm_generated_doc_summary, 
+            "document_summary": llm_generated_doc_summary, # Store the LLM-generated one
             "entities": chunk_entities, 
             "relationships": chunk_relationships 
         }
@@ -508,12 +605,18 @@ class ChunkingEmbeddingPDFProcessor:
                 pdf_pages_data.append((page_num, page_text))
                 full_document_text_parts.append(page_text)
 
-            if not any(pt for _, pt in pdf_pages_data if pt.strip()):
+            if not any(pt.strip() for _, pt in pdf_pages_data): # Check if any page has actual text
                 logger.warning(f"No text extracted from any page in '{file_name}'. Aborting processing for this PDF.")
                 return
 
-            full_document_text = "\n\n".join(full_document_text_parts)
-            llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+            full_document_text = "\n\n".join(filter(None, full_document_text_parts)) # Join only non-empty parts
+            llm_generated_doc_summary = ""
+            if full_document_text.strip(): # Only generate summary if there's text
+                llm_generated_doc_summary = await self._generate_document_summary(full_document_text)
+            else:
+                logger.warning(f"Full document text for '{file_name}' is empty after joining parts. Skipping LLM summary.")
+                llm_generated_doc_summary = "Document appears to be empty or contains no extractable text."
+
 
             all_raw_chunks_with_meta = await self._generate_all_raw_chunks_from_pages(
                 pdf_pages_data, file_name, doc_id
@@ -556,7 +659,9 @@ class ChunkingEmbeddingPDFProcessor:
 
         except Exception as e:
             logger.error(f"Major failure in process_pdf for '{file_name}': {e}", exc_info=True)
-            raise 
+            # Optionally re-raise or handle more gracefully depending on desired behavior
+            # For a script, re-raising might be okay. In a service, you might want to avoid crashing.
+            # raise 
 
 async def ensure_es_index_exists(client: AsyncElasticsearch, index_name: str, mappings_body: Dict):
     if client is None:
@@ -568,24 +673,70 @@ async def ensure_es_index_exists(client: AsyncElasticsearch, index_name: str, ma
             logger.info(f"Elasticsearch index '{index_name}' created with specified mappings.")
             return True
         else: 
-            current_mapping = await client.indices.get_mapping(index=index_name)
-            current_properties = current_mapping.get(index_name, {}).get('mappings', {}).get('properties', {}).get('metadata', {}).get('properties', {})
-            expected_metadata_properties = mappings_body.get('mappings', {}).get('properties', {}).get('metadata', {}).get('properties', {})
+            # Check for critical metadata fields, e.g., document_summary
+            current_mapping_response = await client.indices.get_mapping(index=index_name)
+            current_top_level_props = current_mapping_response.get(index_name, {}).get('mappings', {}).get('properties', {})
+            current_metadata_props = current_top_level_props.get('metadata', {}).get('properties', {})
             
-            if "document_summary" not in current_properties:
-                logger.warning(f"Field 'document_summary' missing in index '{index_name}'. Attempting to update mapping.")
-                try:
-                    update_body = {"properties": {"metadata": {"properties": {"document_summary": expected_metadata_properties["document_summary"]}}}}
-                    await client.indices.put_mapping(index=index_name, body=update_body)
-                    logger.info(f"Successfully added 'document_summary' field to mapping of index '{index_name}'.")
-                except Exception as map_e:
-                    logger.error(f"Failed to update mapping for index '{index_name}' to add 'document_summary': {map_e}. This might cause issues.", exc_info=True)
-            elif current_properties.get("document_summary") != expected_metadata_properties.get("document_summary"):
-                 logger.warning(f"Elasticsearch index '{index_name}' exists but 'document_summary' mapping differs. This might cause issues.")
-                 logger.debug(f"Current 'document_summary' mapping: {current_properties.get('document_summary')}")
-                 logger.debug(f"Expected 'document_summary' mapping: {expected_metadata_properties.get('document_summary')}")
-            else:
-                logger.info(f"Elasticsearch index '{index_name}' already exists and 'document_summary' field is consistent.")
+            expected_top_level_props = mappings_body.get('mappings', {}).get('properties', {})
+            expected_metadata_props = expected_top_level_props.get('metadata', {}).get('properties', {})
+            
+            missing_fields = []
+            different_fields = []
+
+            # Check top-level fields like 'embedding'
+            for field, expected_field_mapping in expected_top_level_props.items():
+                if field == "metadata": continue # Handled separately
+                if field not in current_top_level_props:
+                    missing_fields.append(field)
+                elif current_top_level_props[field].get('type') != expected_field_mapping.get('type'):
+                    if field == "embedding" and current_top_level_props[field].get('type') == 'dense_vector' and expected_field_mapping.get('type') == 'dense_vector':
+                        if current_top_level_props[field].get('dims') != expected_field_mapping.get('dims'):
+                            different_fields.append(f"{field} (dims: {current_top_level_props[field].get('dims')} vs {expected_field_mapping.get('dims')})")
+                    else:
+                        different_fields.append(f"{field} (type: {current_top_level_props[field].get('type')} vs {expected_field_mapping.get('type')})")
+            
+            # Check metadata fields
+            if expected_metadata_props: # Ensure there are expected metadata fields
+                for field, expected_meta_mapping in expected_metadata_props.items():
+                    if field not in current_metadata_props:
+                        missing_fields.append(f"metadata.{field}")
+                    elif current_metadata_props[field].get('type') != expected_meta_mapping.get('type'):
+                        different_fields.append(f"metadata.{field} (type: {current_metadata_props[field].get('type')} vs {expected_meta_mapping.get('type')})")
+
+
+            if missing_fields:
+                logger.warning(f"Fields {missing_fields} missing in index '{index_name}'. Attempting to update mapping.")
+                # This simplified update might not work for all cases, especially nested ones.
+                # For production, a more robust mapping update strategy might be needed.
+                update_body_props_for_put_mapping = {}
+                metadata_updates = {}
+
+                for field_path_to_add in missing_fields:
+                    if field_path_to_add.startswith("metadata."):
+                        field_name = field_path_to_add.split("metadata.")[1]
+                        if field_name in expected_metadata_props:
+                            metadata_updates[field_name] = expected_metadata_props[field_name]
+                    elif field_path_to_add in expected_top_level_props:
+                         update_body_props_for_put_mapping[field_path_to_add] = expected_top_level_props[field_path_to_add]
+                
+                if metadata_updates:
+                    update_body_props_for_put_mapping["metadata"] = {"properties": metadata_updates}
+
+                if update_body_props_for_put_mapping:
+                    try:
+                        await client.indices.put_mapping(index=index_name, properties=update_body_props_for_put_mapping)
+                        logger.info(f"Successfully attempted to add missing fields {missing_fields} to mapping of index '{index_name}'.")
+                    except Exception as map_e:
+                        logger.error(f"Failed to update mapping for index '{index_name}' to add fields: {map_e}. This might cause issues.", exc_info=True)
+                else:
+                    logger.warning(f"Could not prepare update body for missing fields in '{index_name}'.")
+            
+            if different_fields:
+                logger.warning(f"Elasticsearch index '{index_name}' exists but mappings for fields {different_fields} differ. This might cause issues.")
+
+            if not missing_fields and not different_fields:
+                logger.info(f"Elasticsearch index '{index_name}' already exists and critical fields appear consistent.")
             return True 
     except Exception as e:
         logger.error(f"Error with Elasticsearch index '{index_name}': {e}", exc_info=True)
@@ -595,9 +746,12 @@ async def example_run_pdf_processing(pdf_data: str | bytes, original_file_name: 
     if not es_client:
         logger.error("Elasticsearch client not configured. Aborting example run.")
         return
-    if not aclient_openai: 
-        logger.error("OpenAI client not configured. Aborting example run.")
+    if not aclient_openai and OPENAI_API_KEY: # Check if key exists but client failed
+        logger.error("OpenAI client not configured despite API key. Aborting example run.")
         return
+    if not OPENAI_API_KEY: # Explicitly warn if no key, as some operations will be skipped
+         logger.warning("OPENAI_API_KEY is not set. LLM-dependent operations (summary, KG, enrichment, embeddings) will be skipped or use placeholders.")
+
 
     if not await ensure_es_index_exists(es_client, ELASTICSEARCH_INDEX_CHUNKS, CHUNKED_PDF_MAPPINGS):
         logger.error(f"Failed to ensure Elasticsearch index '{ELASTICSEARCH_INDEX_CHUNKS}' exists or is compatible. Aborting.")
@@ -633,11 +787,13 @@ async def example_run_pdf_processing(pdf_data: str | bytes, original_file_name: 
             if errors:
                 logger.error(f"Elasticsearch bulk ingestion errors ({len(errors)}):")
                 for i, err_info in enumerate(errors):
-                    error_details_dict = err_info.get('index', err_info.get('create', err_info.get('update', err_info.get('delete', {}))))
-                    status = error_details_dict.get('status', 'N/A')
-                    error_type = error_details_dict.get('error', {}).get('type', 'N/A')
-                    error_reason = error_details_dict.get('error', {}).get('reason', 'N/A')
-                    doc_id_errored = error_details_dict.get('_id', 'N/A')
+                    # More robust error detail extraction
+                    error_item = err_info.get('index', err_info.get('create', err_info.get('update', err_info.get('delete', {}))))
+                    status = error_item.get('status', 'N/A')
+                    error_details = error_item.get('error', {})
+                    error_type = error_details.get('type', 'N/A')
+                    error_reason = error_details.get('reason', 'N/A')
+                    doc_id_errored = error_item.get('_id', 'N/A')
                     logger.error(f"Error {i+1}: Doc ID '{doc_id_errored}', Status {status}, Type '{error_type}', Reason: {error_reason}")
         else:
             logger.info(f"No chunks generated or processed for ingestion from '{original_file_name}'.")
@@ -653,9 +809,10 @@ def _generate_doc_id_from_content(content_bytes: bytes) -> str:
     return sha256_hash.hexdigest()
 
 if __name__ == "__main__":
-    logging.getLogger("src.core.ingestion.chunking_pdf_processor").setLevel(logging.DEBUG)
-    logging.getLogger("__main__").setLevel(logging.DEBUG) 
-    logging.getLogger("elasticsearch").setLevel(logging.WARNING) 
+    # Setup more verbose logging for the main script execution
+    logging.getLogger("src.core.ingestion.chunking_pdf_processor").setLevel(logging.DEBUG) # Module specific
+    logging.getLogger("__main__").setLevel(logging.DEBUG) # For this script's direct logs
+    logging.getLogger("elasticsearch").setLevel(logging.WARNING) # Quieten Elasticsearch library logs unless error
 
     async def main_example():
         if not es_client:

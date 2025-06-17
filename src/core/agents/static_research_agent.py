@@ -209,8 +209,16 @@ class StaticResearchAgent:
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_knowledge."
                 
-                tool_output_obj = await self.knowledge_search_method(query=query, agent_config=current_config) 
+                # The knowledge_search_method now returns AggregateSearchResult which includes llm_formatted_context
+                tool_output_obj: AggregateSearchResult = await self.knowledge_search_method(query=query, agent_config=current_config) 
                 
+                # Use the pre-formatted context string if available and the agent is configured to do so
+                if current_config.get("use_llm_formatted_context_from_retriever", True) and tool_output_obj.llm_formatted_context:
+                    logger.debug(f"Using llm_formatted_context from retriever for tool {tool_name}")
+                    return tool_output_obj.llm_formatted_context
+
+                # Fallback to old formatting if llm_formatted_context is not available or not used
+                logger.debug(f"Falling back to manual formatting for tool {tool_name} output.")
                 formatted_output_parts = []
                 if tool_output_obj.chunk_search_results:
                     formatted_output_parts.append("Chunk Results:")
@@ -243,9 +251,14 @@ class StaticResearchAgent:
                         rels_str = ", ".join([f"{r.source_entity}->{r.relation}->{r.target_entity}" for r in kg_item.relationships[:1] if r.source_entity and r.relation and r.target_entity])
                         if len(kg_item.relationships) > 1: rels_str += "..."
                         
-                        chunk_text_snippet = kg_item.chunk_text or ""
-                        if len(chunk_text_snippet) > 100: chunk_text_snippet = chunk_text_snippet[:97] + "..."
-                        formatted_output_parts.append(f"  Source ID [{source_id}]: Entities: [{entities_str or 'None'}]. Relationships: [{rels_str or 'None'}]. (Chunk: {chunk_text_snippet})")
+                        # chunk_text for KG items is not in AggregateSearchResult.graph_search_results by default
+                        # as per the new structure. If it were, it would be kg_item.chunk_text
+                        chunk_text_snippet = "N/A" # Placeholder as chunk_text is not directly on KGSearchResult
+                        # if kg_item.chunk_text:
+                        #    chunk_text_snippet = kg_item.chunk_text
+                        #    if len(chunk_text_snippet) > 100: chunk_text_snippet = chunk_text_snippet[:97] + "..."
+                        
+                        formatted_output_parts.append(f"  Source ID [{source_id}]: Entities: [{entities_str or 'None'}]. Relationships: [{rels_str or 'None'}]. (Associated Context: {chunk_text_snippet})")
 
                 if not formatted_output_parts:
                     return "No relevant information found by search_file_knowledge."
@@ -255,17 +268,24 @@ class StaticResearchAgent:
                 query = parameters.get("query")
                 if not query: return "Error: 'query' parameter missing for search_file_descriptions."
                 logger.warning("search_file_descriptions tool is using general RAG search, not a dedicated description search.")
+                # file_search_method returns a dict, not AggregateSearchResult directly
                 search_results_dict = await self.file_search_method(query=query, agent_config=current_config)
-                return self._format_search_results(search_results_dict, subquery_limit=1)
+                # Use the llm_formatted_context from this dict if available
+                if current_config.get("use_llm_formatted_context_from_retriever", True) and search_results_dict.get("llm_formatted_context"):
+                    return search_results_dict["llm_formatted_context"]
+                return self._format_search_results(search_results_dict, subquery_limit=1) # Fallback formatting
 
 
             elif tool_name == "get_file_content":
                 doc_id = parameters.get("document_id")
                 if not doc_id: return "Error: 'document_id' parameter missing for get_file_content."
                 logger.warning(f"get_file_content tool is simulating full doc retrieval using RAG search for doc_id: {doc_id}.")
+                # content_method returns a dict
                 content_results_dict = await self.content_method(filters={"id": {"$eq": doc_id}}, agent_config=current_config)
-                # Format this dict.
-                return self._format_search_results(content_results_dict, subquery_limit=1) # Assuming similar structure for now
+                # Use the llm_formatted_context from this dict if available
+                if current_config.get("use_llm_formatted_context_from_retriever", True) and content_results_dict.get("llm_formatted_context"):
+                    return content_results_dict["llm_formatted_context"]
+                return self._format_search_results(content_results_dict, subquery_limit=1) # Fallback formatting
 
             else: 
                 if hasattr(tool_instance, 'execute'):
@@ -309,30 +329,32 @@ class StaticResearchAgent:
         if current_config.get("perform_initial_retrieval", True):
             try:
                 logger.info("Performing initial retrieval...")
-                initial_search_results = await self.retriever.search(
+                # The retriever.search now returns a dict including 'llm_formatted_context'
+                initial_search_results_dict = await self.retriever.search(
                     user_query=query, 
                     num_subqueries=initial_retrieval_num_sq,
                     top_k_chunks=initial_retrieval_top_k_chunks, 
                     top_k_kg=initial_retrieval_top_k_kg
                 )
-                initial_context = self._format_search_results(initial_search_results, subquery_limit=initial_retrieval_num_sq)
+                # Use the pre-formatted context if available and configured
+                if current_config.get("use_llm_formatted_context_from_retriever", True) and initial_search_results_dict.get("llm_formatted_context"):
+                    initial_context = initial_search_results_dict["llm_formatted_context"]
+                else: # Fallback to old formatting
+                    initial_context = self._format_search_results(initial_search_results_dict, subquery_limit=initial_retrieval_num_sq)
+                
                 logger.debug(f"Initial context formatted (first 500 chars): {initial_context[:500]}")
             except Exception as e:
                 logger.error(f"Error during initial retrieval: {e}", exc_info=True)
                 initial_context = "Error during initial search."
         
         # 2. Prepare System Prompt
-        # Assuming date is passed or obtained somehow; for now, a placeholder.
-        current_date_str = current_config.get("current_date", "today") # Could be dynamic
+        current_date_str = current_config.get("current_date", "today") 
         
-        # Construct tool definitions string for the prompt
         tool_definitions_str = "<AvailableTools>\n"
         for tool_name, tool_instance in self.tools.items():
             tool_definitions_str += f"  <ToolDefinition>\n"
             tool_definitions_str += f"    <Name>{tool_instance.name}</Name>\n"
             tool_definitions_str += f"    <Description>{tool_instance.description}</Description>\n"
-            # Parameters need to be in the specific XML format expected by the prompt
-            # Assuming tool_instance.parameters is a JSON schema dict
             params_xml = "    <Parameters>\n"
             if tool_instance.parameters and "properties" in tool_instance.parameters:
                 for param_name, param_details in tool_instance.parameters["properties"].items():
@@ -347,15 +369,13 @@ class StaticResearchAgent:
 
         system_prompt = self.system_prompt_template.format(
             date=current_date_str,
-            initial_context=initial_context, # Pass initial search results into the system prompt
-            tool_definitions=tool_definitions_str # Pass tool definitions
+            initial_context=initial_context, 
+            tool_definitions=tool_definitions_str 
         )
         messages.append({"role": "system", "content": system_prompt})
         
-        # 3. Add User Query
         messages.append({"role": "user", "content": query})
 
-        # 4. Main Interaction Loop
         iterations_count = 0
         while iterations_count < current_max_iterations:
             iterations_count += 1
@@ -428,6 +448,7 @@ class StaticResearchAgent:
         top_k_c = effective_config.get("tool_top_k_chunks", 3)
         top_k_kg_val = effective_config.get("tool_top_k_kg", 2)
 
+        # This call now returns a dict that includes "llm_formatted_context"
         raw_results_dict = await self.retriever.search(
             user_query=query, 
             num_subqueries=num_sq,
@@ -435,12 +456,18 @@ class StaticResearchAgent:
             top_k_kg=top_k_kg_val
         )
 
-        agg_result = AggregateSearchResult(query=query)
+        # Extract the formatted context
+        llm_formatted_context = raw_results_dict.get("llm_formatted_context")
+
+        # Construct AggregateSearchResult and populate its fields
+        agg_result = AggregateSearchResult(query=query, llm_formatted_context=llm_formatted_context) # Pass the new context
         
         if raw_results_dict and "sub_queries_results" in raw_results_dict:
             for sq_res in raw_results_dict["sub_queries_results"]:
                 for chunk_data in sq_res.get("reranked_chunks", []):
-                    # Ensure all keys expected by ChunkSearchResult are present or have defaults
+                    if not isinstance(chunk_data, dict): 
+                        logger.warning(f"Skipping non-dict chunk_data in knowledge_search_method: {chunk_data}")
+                        continue
                     mapped_chunk_data = {
                         "text": chunk_data.get("text"),
                         "score": chunk_data.get("score"),
@@ -450,74 +477,86 @@ class StaticResearchAgent:
                         "page_number": chunk_data.get("page_number"),
                         "chunk_index_in_page": chunk_data.get("chunk_index_in_page"),
                     }
-                    agg_result.chunk_search_results.append(ChunkSearchResult(**mapped_chunk_data))
-                
+                    try:
+                        agg_result.chunk_search_results.append(ChunkSearchResult(**mapped_chunk_data))
+                    except Exception as e_chunk:
+                        logger.error(f"Error creating ChunkSearchResult from data: {mapped_chunk_data}, error: {e_chunk}", exc_info=True)
+
+                # 'retrieved_kg_data' from raw_results_dict is the list of KG items (dicts)
+                # where 'chunk_text' has already been removed by RAGFusionRetriever.search
                 for kg_data_item in sq_res.get("retrieved_kg_data", []):
-                    entities = [KGEntity(**e_data) for e_data in kg_data_item.get("entities", [])]
-                    relationships = [KGRelationship(**r_data) for r_data in kg_data_item.get("relationships", [])]
+                    if not isinstance(kg_data_item, dict):
+                        logger.warning(f"Skipping non-dict kg_data_item in knowledge_search_method: {kg_data_item}")
+                        continue
+                    
+                    entities_data = kg_data_item.get("entities", [])
+                    relationships_data = kg_data_item.get("relationships", [])
+                    
+                    entities = [KGEntity(**e_data) for e_data in entities_data if isinstance(e_data, dict)]
+                    relationships = [KGRelationship(**r_data) for r_data in relationships_data if isinstance(r_data, dict)]
                     
                     mapped_kg_data = {
-                        "chunk_text": kg_data_item.get("chunk_text"),
+                        # "chunk_text" is not expected here as it's popped by retriever for this final structure
                         "entities": entities,
                         "relationships": relationships,
                         "score": kg_data_item.get("score"),
-                        "rerank_score": kg_data_item.get("rerank_score"), # Though KG not typically reranked by score
+                        "rerank_score": kg_data_item.get("rerank_score"),
                         "file_name": kg_data_item.get("file_name"),
                         "doc_id": kg_data_item.get("doc_id"),
                         "page_number": kg_data_item.get("page_number"),
                         "chunk_index_in_page": kg_data_item.get("chunk_index_in_page"),
                     }
-                    agg_result.graph_search_results.append(KGSearchResult(**mapped_kg_data))
+                    try:
+                        agg_result.graph_search_results.append(KGSearchResult(**mapped_kg_data))
+                    except Exception as e_kg:
+                         logger.error(f"Error creating KGSearchResult from data: {mapped_kg_data}, error: {e_kg}", exc_info=True)
         return agg_result
 
-    async def file_search_method(self, query: str, agent_config: Optional[Dict[str, Any]] = None):
+    async def file_search_method(self, query: str, agent_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: # Return type changed to Dict
         effective_config = agent_config or self.config
         logger.debug(f"Agent's file_search_method called with query: {query}")
         # This tool is for descriptions, so focus on text chunks, less on KG.
-        results = await self.retriever.search(
+        # RAGFusionRetriever.search returns a dictionary
+        results_dict = await self.retriever.search(
             user_query=query, 
             num_subqueries=effective_config.get("tool_file_search_subqueries", 1), 
             top_k_chunks=effective_config.get("tool_file_search_top_k_chunks", 5), 
             top_k_kg=0 # No KG for file description search
         )
-        return results 
+        return results_dict 
 
-    async def content_method(self, filters: Dict, agent_config: Optional[Dict[str, Any]] = None, options: Optional[Dict] = None):
+    async def content_method(self, filters: Dict, agent_config: Optional[Dict[str, Any]] = None, options: Optional[Dict] = None) -> Dict[str, Any]: # Return type changed
         effective_config = agent_config or self.config
         logger.debug(f"Agent's content_method called with filters: {filters}")
-        doc_id_filter = filters.get("id", {}).get("$eq") # Assuming filter format like {"id": {"$eq": "doc_id_value"}}
+        doc_id_filter = filters.get("id", {}).get("$eq") 
         if doc_id_filter:
-            # Simulate by searching for this doc_id, get more chunks
             query = f"Retrieve all content for document ID {doc_id_filter}" 
-            results = await self.retriever.search(
+            # RAGFusionRetriever.search returns a dictionary
+            results_dict = await self.retriever.search(
                 user_query=query, 
-                num_subqueries=1, # Focus on the specific doc
+                num_subqueries=1, 
                 top_k_chunks=effective_config.get("tool_content_top_k_chunks", 10), 
-                top_k_kg=0 # Less emphasis on KG for "get content"
+                top_k_kg=0 
             )
-            return results
-        return {"error": "Document ID filter not correctly processed or missing in agent's content_method"}
+            return results_dict
+        return {"error": "Document ID filter not correctly processed or missing in agent's content_method", "sub_queries_results": []} # Ensure dict structure
 
     @property
     def search_settings(self): 
-        # This might be used by tools if they expect a specific settings object.
-        # For now, RAGFusionRetriever parameters are controlled via its method calls.
         return {
             "dummy_setting": "placeholder_value" 
-            # Add actual relevant settings if tools evolve to use this
         }
 
 async def main_research_agent_example():
     if not logging.getLogger().hasHandlers():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logging.getLogger("src.core.agents.static_research_agent").setLevel(logging.DEBUG)
-    logging.getLogger("src.core.retrieval.rag_fusion_retriever").setLevel(logging.INFO) # Keep retriever a bit quieter for agent logs
+    logging.getLogger("src.core.retrieval.rag_fusion_retriever").setLevel(logging.INFO) 
 
+    agent = None # Initialize agent to None for finally block
     try:
         agent = StaticResearchAgent()
         
-        # Example query
-        # query = "What are the recent advancements in quantum computing and their potential impact on cryptography?"
         query = input("Enter your research query for the StaticResearchAgent: ").strip()
         if not query:
             print("No query entered. Exiting.")
@@ -543,14 +582,20 @@ async def main_research_agent_example():
     except Exception as e:
         logger.error(f"An error occurred during the agent example run: {e}", exc_info=True)
     finally:
-        # Clean up clients if they were created by the agent's default constructor
-        if hasattr(agent, 'llm_client') and isinstance(agent.llm_client, AsyncOpenAI):
-             if hasattr(agent.llm_client, "aclose"): await agent.llm_client.aclose()
-        if hasattr(agent, 'retriever') and hasattr(agent.retriever, 'es_client') and agent.retriever.es_client:
-             if hasattr(agent.retriever.es_client, "close"): await agent.retriever.es_client.close()
-        # Note: RAGFusionRetriever's OpenAI client is shared (aclient_openai module global),
-        # it should be closed at the application's very end if created globally.
-        # If agent created its own retriever which created its own clients, they'd be closed above.
+        if agent: # Check if agent was successfully initialized
+            if hasattr(agent, 'llm_client') and isinstance(agent.llm_client, AsyncOpenAI):
+                 if hasattr(agent.llm_client, "aclose"): 
+                     await agent.llm_client.aclose()
+                     logger.info("Agent's OpenAI client closed.")
+            if hasattr(agent, 'retriever') and hasattr(agent.retriever, 'es_client') and agent.retriever.es_client:
+                 if hasattr(agent.retriever.es_client, "close"): 
+                     await agent.retriever.es_client.close()
+                     logger.info("Agent's retriever's Elasticsearch client closed.")
+            # RAGFusionRetriever's OpenAI client (aclient_openai) is a module global.
+            # It should be closed by the RAGFusionRetriever's main_example_search or similar global cleanup if that's the entry point.
+            # If this agent example is the main entry, and RAGFusionRetriever's global aclient_openai was used,
+            # we might need a more robust way to ensure its closure.
+            # For now, assuming RAGFusionRetriever handles its own global client closure if it created it.
 
 if __name__ == "__main__":
     asyncio.run(main_research_agent_example())

@@ -37,3 +37,4 @@ class AggregateSearchResult(BaseModel):
     query: Optional[str] = None
     chunk_search_results: List[ChunkSearchResult] = Field(default_factory=list)
     graph_search_results: List[KGSearchResult] = Field(default_factory=list)
+    llm_formatted_context: Optional[str] = None # New field
